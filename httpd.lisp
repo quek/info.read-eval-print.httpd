@@ -97,49 +97,85 @@
    (bind-address :initarg :bind-address :initform "0.0.0.0")
    (listen-socket)
    (listen-fd)
-   (epoll-fd)
-   (fd-hash :initform (make-hash-table))
-   (buffer :initform (cffi:foreign-alloc :uchar :count +bufsiz+))))
+   (number-of-threads :initarg :number-of-threads :initform 2)))
+
+(defvar *server*)
+(defvar *fd-hash*)
+(defvar *epoll-fd*)
+(defvar *buffer*)
+
+(defun add-to-wait (pipe-fd)
+  (cffi:with-foreign-object (buf :int)
+    (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
+    (let ((fd (cffi:mem-aref buf :int 0)))
+      (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))
+
+(defun dispatch-epoll-event (fd event)
+  (let ((event-mask (cffi:foreign-slot-value event 'isys:epoll-event 'isys:events)))
+    (cond ((plusp (logand event-mask isys:epollin) )
+           (receive-request *server* fd))
+          ((plusp (logand event-mask isys:epollout))
+           (send-response *server* fd))
+          ((plusp (logand event-mask isys:epollhup))
+           (close-connection *server* fd)))))
+
+(defun start-handler-thread (server fd-hash epoll-fd pipe-fd)
+  (let ((*server* server)
+        (*fd-hash* fd-hash)
+        (*epoll-fd* epoll-fd)
+        (*buffer* (cffi:foreign-alloc :uchar :count +bufsiz+)))
+    (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
+      (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
+      (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+ 10000)
+                              (isys:eintr ()
+                                (warn "epoll-wait EINTR")
+                                0))
+            do (loop for i below ready-fds
+                     for event = (cffi:mem-aref events 'isys:epoll-event i)
+                     for event-fd = (cffi:foreign-slot-value
+                                     (cffi:foreign-slot-value event 'isys:epoll-event 'isys:data)
+                                     'isys:epoll-data 'isys:fd)
+                     if (= event-fd pipe-fd)
+                       do (add-to-wait pipe-fd)
+                     else
+                       do (dispatch-epoll-event event-fd event))))))
+
+(defun start-accept-thread (server)
+  (let ((*server* server)
+        (*fd-hash* (make-hash-table))
+        (*epoll-fd* (isys:epoll-create 1)))
+    (multiple-value-bind (pipe-read pipe-write) (sb-posix:pipe)
+      (epoll-ctl pipe-read *epoll-fd* isys:epoll-ctl-add isys:epollin)
+      (sb-thread:make-thread #'start-handler-thread
+                             :name (format nil "handler of ~a"
+                                           (sb-thread:thread-name sb-thread:*current-thread*))
+                             :arguments (list *server* *fd-hash* *epoll-fd* pipe-read))
+      (cffi:with-foreign-object (buf :int)
+        (loop with listen-fd = (slot-value server 'listen-fd)
+              for client-fd = (iolib.sockets::with-sockaddr-storage-and-socklen (ss size)
+                                (iolib.sockets::%accept listen-fd ss size))
+              do (setf (cffi:mem-aref buf :int 0) client-fd)
+                 (sb-posix:write pipe-write buf #.(cffi:foreign-type-size :int)))))))
 
 (defmethod start (server)
-  (with-slots (port bind-address listen-socket listen-fd epoll-fd fd-hash) server
+  (with-slots (port bind-address listen-socket listen-fd number-of-threads) server
     (iolib.sockets:with-open-socket (%listen-socket :address-family :ipv4
                                                     :type :stream
                                                     :connect :passive
                                                     :local-host bind-address
                                                     :local-port port
-                                                    :reuse-address t)
+                                                    :reuse-address t
+                                                    :backlog iolib.sockets::+max-backlog-size+)
       (setf listen-socket %listen-socket)
-      (iolib.sockets::listen-on listen-socket)
       (setf listen-fd (iolib.streams:fd-of listen-socket))
-      (setf epoll-fd (isys:epoll-create 1))
-      (epoll-ctl listen-fd epoll-fd isys:epoll-ctl-add isys:epollin isys:epollhup)
-      (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
-        (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
-        (loop for ready-fds = (isys:epoll-wait epoll-fd events iomux::+epoll-max-events+ 10000)
-              do (loop for i below ready-fds
-                       for event = (cffi:mem-aref events 'isys:epoll-event i)
-                       for event-fd = (cffi:foreign-slot-value
-                                       (cffi:foreign-slot-value event 'isys:epoll-event 'isys:data)
-                                       'isys:epoll-data 'isys:fd)
-                       if (= event-fd listen-fd)
-                         do (accept server)
-                       else
-                         do (let ((event-mask (cffi:foreign-slot-value event
-                                                                       'isys:epoll-event
-                                                                       'isys:events)))
-                              (cond ((plusp (logand event-mask isys:epollin) )
-                                     (receive-request server event-fd))
-                                    ((plusp (logand event-mask isys:epollout))
-                                     (send-response server event-fd))
-                                    ((plusp (logand event-mask isys:epollhup))
-                                     (close-connection server event-fd))))))))))
-
-(defmethod accept (server)
-  (with-slots (listen-socket epoll-fd) server
-    (let* ((socket (iolib.sockets:accept-connection listen-socket))
-           (fd (iolib.streams:fd-of socket)))
-      (epoll-ctl fd epoll-fd isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))
+      (setf (isys:fd-nonblock listen-fd) nil)
+      (let ((threads (collect 'bag
+                       (let ((thread-name (format nil "accepter ~d"
+                                                  (1+ (scan-range :length number-of-threads)))))
+                         (sb-thread:make-thread #'start-accept-thread
+                                                :name thread-name
+                                                :arguments (list server))))))
+        (collect-ignore (sb-thread:join-thread (scan 'list threads)))))))
 
 (defclass request ()
   ((method :initarg :method)
@@ -164,24 +200,23 @@
                    :query-string query-string)))
 
 (defmethod read-request (server fd request-string)
-  (with-slots (epoll-fd fd-hash) server
-    (setf (gethash fd fd-hash)
-          (make-request request-string))
-    (epoll-ctl fd epoll-fd isys:epoll-ctl-mod isys:epollout isys:epollhup epollet)))
+  (setf (gethash fd *fd-hash*)
+        (make-request request-string))
+  (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
 
 
 (defmethod receive-request (server fd)
-  (with-slots (epoll-fd fd-hash buffer) server
-    (let ((read-size (iolib.syscalls:read fd buffer +bufsiz+)))
-      (if (plusp read-size)
-          (progn
-            (read-request server fd (cffi:foreign-string-to-lisp buffer :count read-size))
-            (epoll-ctl fd epoll-fd isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
-          (close-connection server fd)))))
+  (let ((read-size (iolib.syscalls:read fd *buffer* +bufsiz+)))
+    (if (plusp read-size)
+        (progn
+          (read-request server fd (cffi:foreign-string-to-lisp *buffer* :count read-size))
+          (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
+        (close-connection server fd))))
 
 (defmethod send-response (server fd)
-  (with-slots (epoll-fd fd-hash document-root) server
-    (let ((request (gethash fd fd-hash)))
+  (print (list :send-respones sb-thread:*current-thread*))
+  (with-slots (document-root) server
+    (let ((request (gethash fd *fd-hash*)))
       (when request
         (with-slots (path) request
           (let ((full-path (concatenate 'string document-root path)))
@@ -192,10 +227,9 @@
     (close-connection server fd)))
 
 (defmethod close-connection (server fd)
-  (with-slots (epoll-fd fd-hash) server
-    (remhash fd fd-hash)
-    (epoll-ctl fd epoll-fd isys:epoll-ctl-del)
-    (isys:close fd)))
+  (remhash fd *fd-hash*)
+  (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
+  (isys:close fd))
 
 (defmethod response-404 (server fd)
   (let ((res (format nil "HTTP/1.0 404 Not Found~c~c~c~cNot Found"
