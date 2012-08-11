@@ -37,6 +37,7 @@
                       (response-404 server fd)
                       (return-from response-file))))
          (st (isys:fstat file-fd)))
+    ;; sendfile の前のレスポンスヘッダを小分けで送らないために TCP_CROK
     (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp
                                           iolib.sockets::tcp-cork 1)
     (cffi:with-foreign-string (s *response-header*)
@@ -62,6 +63,7 @@
       array)
   :test #'equalp)
 
+(declaim (inline nurl-decode))
 (defun nurl-decode (buffer start end)
   (declare (type (simple-array (unsigned-byte 8)) buffer))
   (loop with i = start
@@ -123,7 +125,7 @@
   (let ((*server* server)
         (*fd-hash* fd-hash)
         (*epoll-fd* epoll-fd)
-        (*buffer* (cffi:foreign-alloc :uchar :count +bufsiz+)))
+        (*buffer* (make-array +bufsiz+ :element-type '(unsigned-byte 8))))
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
       (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
       (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+ 10000)
@@ -177,48 +179,49 @@
                                                 :arguments (list server))))))
         (collect-ignore (sb-thread:join-thread (scan 'list threads)))))))
 
-(defclass request ()
-  ((method :initarg :method)
-   (path :initarg :path)
-   (query-string :initarg :query-string)))
-
-(defun make-request (request-string)
-  (let ((start 0)
-        (end (position #\space request-string :start 3))
-        method path query-string)
-    (setf method (subseq request-string start end))
+(defun make-env (buffer)
+  (let ((env (make-hash-table :test 'equal))
+        (start 0)
+        (end (position #.(char-code #\space) buffer :start 3)))
+    (setf (gethash "REQUEST_METHOD" env)
+          (sb-ext:octets-to-string buffer :start start :end end))
     (setf start (incf end))
-    (setf end (position #\space request-string :start end))
-    (setf path (subseq request-string start end))
-    (let ((? (position #\? path)))
-      (when ?
-        (setf query-string (subseq path (1+ ?)))
-        (setf path (subseq path 0 ?))))
-    (make-instance 'request
-                   :method method
-                   :path path
-                   :query-string query-string)))
+    (setf end (position #.(char-code #\space) buffer :start (incf end)))
+    (let ((request-uri (sb-ext:octets-to-string buffer :start start :end end)))
+      (setf (gethash "REQUEST_URI" env) request-uri)
+      (let ((? (position #\? buffer :start start :end end)))
+        (setf (gethash "QUERY_STRING" env) (if ? (subseq request-uri (1+ ?)) ""))
+        (setf (gethash "PATH_INFO" env) (nurl-decode buffer start (or ? end)))))
+    (setf start (incf end))
+    (setf end (position #.(char-code #\cr) buffer :start start))
+    (setf (gethash "SERVER_PROTOCOL" env) (sb-ext:octets-to-string buffer :start start :end end))
+    #+nil
+    (print (multiple-value-bind (k v) (scan-hash env)
+             (collect-alist k v)))
+    env))
 
-(defmethod read-request (server fd request-string)
-  (setf (gethash fd *fd-hash*)
-        (make-request request-string))
+(defmethod parse-request (server fd buffer)
+  (setf (gethash fd *fd-hash*) (make-env buffer))
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
 
 
 (defmethod receive-request (server fd)
-  (let ((read-size (iolib.syscalls:read fd *buffer* +bufsiz+)))
+  (let ((read-size
+          (cffi-sys:with-pointer-to-vector-data (pointer *buffer*)
+            (iolib.syscalls:read fd pointer +bufsiz+))))
     (if (plusp read-size)
         (progn
-          (read-request server fd (cffi:foreign-string-to-lisp *buffer* :count read-size))
+          (parse-request server fd *buffer*)
           (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
         (close-connection server fd))))
 
 (defmethod send-response (server fd)
+  #+nil
   (print (list :send-respones sb-thread:*current-thread*))
   (with-slots (document-root) server
     (let ((request (gethash fd *fd-hash*)))
       (when request
-        (with-slots (path) request
+        (let ((path (gethash "PATH_INFO" request)))
           (let ((full-path (concatenate 'string document-root path)))
             (if (and (fad:file-exists-p full-path)
                      (not (fad:directory-exists-p full-path)))
