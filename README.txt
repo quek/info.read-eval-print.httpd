@@ -1,1 +1,0 @@
-A tiny Web server.
