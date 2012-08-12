@@ -30,23 +30,6 @@
   (offset (:pointer isys::off-t))
   (count isys::size-t))
 
-(defun response-file (server fd path)
-  (let* ((file-fd (handler-case (isys::open path isys:o-rdonly)
-                    (isys:enoent ()
-                      (warn "404 not found ~a" path)
-                      (response-404 server fd)
-                      (return-from response-file))))
-         (st (isys:fstat file-fd)))
-    ;; sendfile の前のレスポンスヘッダを小分けで送らないために TCP_CROK
-    (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp
-                                          iolib.sockets::tcp-cork 1)
-    (cffi:with-foreign-string (s *response-header*)
-      (isys:write fd s (length *response-header*)))
-    (sendfile fd file-fd (cffi-sys:null-pointer) (isys:stat-size st))
-    (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp
-                                          iolib.sockets::tcp-cork 0)
-    (isys:close file-fd)))
-
 (alexandria:define-constant +url-decode-table+
     (let ((array (make-array 255 :element-type 'fixnum
                                  :initial-element -1)))
@@ -88,6 +71,8 @@
 (defgeneric start (server))
 (defgeneric stop (server))
 
+(defgeneric call (handler env))
+
 (defgeneric accept (server))
 (defgeneric receive-request (server fd))
 (defgeneric send-response (server fd))
@@ -99,7 +84,8 @@
    (bind-address :initarg :bind-address :initform "0.0.0.0")
    (listen-socket)
    (listen-fd)
-   (number-of-threads :initarg :number-of-threads :initform 2)))
+   (number-of-threads :initarg :number-of-threads :initform 2)
+   (handler :initarg :handler :initform (make-instance 'sendfile-handler))))
 
 (defvar *server*)
 (defvar *fd-hash*)
@@ -201,7 +187,11 @@
     env))
 
 (defmethod parse-request (server fd buffer)
-  (setf (gethash fd *fd-hash*) (make-env buffer))
+  (with-slots (document-root) server
+    (let ((env (make-env buffer)))
+      (setf (gethash fd *fd-hash*) env)
+      (setf (gethash "DOCUMENT_ROOT" env) document-root)
+      (setf (gethash :fd env) fd)))
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
 
 
@@ -215,32 +205,103 @@
           (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
         (close-connection server fd))))
 
+(defvar *env*)
+
 (defmethod send-response (server fd)
-  #+nil
-  (print (list :send-respones sb-thread:*current-thread*))
-  (with-slots (document-root) server
-    (let ((request (gethash fd *fd-hash*)))
-      (when request
-        (let ((path (gethash "PATH_INFO" request)))
-          (let ((full-path (concatenate 'string document-root path)))
-            (if (and (fad:file-exists-p full-path)
-                     (not (fad:directory-exists-p full-path)))
-                (response-file server fd full-path)
-                (response-404 server fd))))))
+  (with-slots (document-root handler) server
+    (let ((*env* (gethash fd *fd-hash*)))
+      (when *env*
+        (multiple-value-call #'%send-response (call handler *env*))))
     (close-connection server fd)))
+
+(defun status-message (status)
+  (case status
+    (200 "OK")
+    (404 "Not Found")
+    (t "que")))
+
+(defun write-response (string)
+  (let ((fd (gethash :fd *env*)))
+    (cffi:with-foreign-string ((s length) string :encoding :utf-8 :null-terminated-p nil)
+      (isys:write fd s length))))
+
+(defmacro with-cork ((fd) &body body)
+  "sendfile の前のレスポンスヘッダを小分けで送らないために TCP_CROK"
+  (alexandria:once-only (fd)
+   `(progn
+      (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
+                                            iolib.sockets::tcp-cork 1)
+      ,@body
+      (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
+                                            iolib.sockets::tcp-cork 0))))
+
+(defun response-file (fd path)
+  (let* ((file-fd (handler-case (isys::open path isys:o-rdonly)
+                    (isys:enoent ()
+                      (warn "404 not found ~a" path)
+                      (return-from response-file nil))))
+         (st (isys:fstat file-fd)))
+    (with-cork (fd)
+      (cffi:with-foreign-string (s *response-header*)
+        (isys:write fd s (length *response-header*)))
+      (sendfile fd file-fd (cffi-sys:null-pointer) (isys:stat-size st)))
+    (isys:close file-fd)
+    t))
+
+(defun %send-response (status headers body)
+  (let ((fd (gethash :fd *env*)))
+    (aif (cdr (assoc "X-Sendfile" headers :test #'equal))
+         (unless (response-file fd it)
+           (multiple-value-call #'%send-response (response-404 t *env*)))
+         (with-cork (fd)
+           (write-response (format nil "HTTP/1.0 ~d ~a~a" status (status-message status) +crlf+))
+           (write-response (collect-append
+                            'string
+                            (multiple-value-bind (k v) (scan-alist headers #'equal)
+                              (format nil "~a: ~a~a" k v +crlf+))))
+           (write-response +crlf+)
+           (collect-ignore (write-response (scan body)))))))
 
 (defmethod close-connection (server fd)
   (remhash fd *fd-hash*)
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
   (isys:close fd))
 
-(defmethod response-404 (server fd)
-  (let ((res (format nil "HTTP/1.0 404 Not Found~c~c~c~cNot Found"
-                     #\cr #\lf #\cr #\lf)))
-    (cffi:with-foreign-string (s res)
-      (isys:write fd s (length res)))))
+(defmethod response-404 (handler env)
+  (values 404 () (list "Not Found. " (gethash "PATH_INFO" env))))
+
+(defclass sendfile-handler ()
+  ())
+
+(defmethod call ((handler sendfile-handler) env)
+  (let ((path (gethash "PATH_INFO" env)))
+    (let ((full-path (concatenate 'string (gethash "DOCUMENT_ROOT" env)  path)))
+      (if (and (fad:file-exists-p full-path)
+               (not (fad:directory-exists-p full-path)))
+          (values 200 `(("X-Sendfile" . ,full-path)) nil)
+          (response-404 handler env)))))
+
+
+(defclass lisp-handler (sendfile-handler)
+  ())
+
+(defmethod call ((handler lisp-handler) env)
+  (multiple-value-bind (status headers body) (call-next-method)
+    (if (= 404 status)
+        (values 200
+                `(("Content-Type" . "text/html; charset=UTF-8"))
+                (list "<ul>"
+                      (collect-append 'string
+                                      (multiple-value-bind (k v) (scan-hash  env)
+                                        (format nil "<li>~a . ~a</li>" k v)))
+                      "</ul>"))
+        (values status headers body))))
+
 
 #|
 (info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server))
+(info.read-eval-print.httpd:start
+ (make-instance 'info.read-eval-print.httpd:server
+                :handler (make-instance 'info.read-eval-print.httpd::lisp-handler)))
 ab -n 10000 -c 10 'http://localhost:1958/sbcl-doc/html/index.html'
 |#

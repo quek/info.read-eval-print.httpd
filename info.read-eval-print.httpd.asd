@@ -4,4 +4,5 @@
                (:file "httpd"))
   :depends-on (:iolib
                :cl-fad
+               :anaphora
                :info.read-eval-print.series-ext))

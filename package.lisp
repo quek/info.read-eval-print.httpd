@@ -2,7 +2,7 @@
 
 (info.read-eval-print.series-ext:sdefpackage
  :info.read-eval-print.httpd
- (:use :cl)
+ (:use :cl :anaphora)
  (:export #:start
           #:server))
 
