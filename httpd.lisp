@@ -1,4 +1,4 @@
-(in-package ::info.read-eval-print.httpd)
+(in-package :info.read-eval-print.httpd)
 
 (defconstant epollet (ash 1 31))
 
@@ -24,7 +24,7 @@
   (format nil "HTTP/1.0 200 OK~c~cLast-modified: Thu, 1 Jan 1970 00:00:00 GMT~c~c~c~c"
           #\cr #\lf #\cr #\lf #\cr #\lf))
 
-(isys:defsyscall (sendfile "sendfile") :int
+(isys:defsyscall (%sendfile "sendfile") :int
   (out-fd :int)
   (in-fd :int)
   (offset (:pointer isys::off-t))
@@ -71,6 +71,8 @@
 (defgeneric start (server))
 (defgeneric stop (server))
 
+(defgeneric handle-request (handler server fd env)
+  (:method-combination or))
 (defgeneric call (handler env))
 
 (defgeneric accept (server))
@@ -85,7 +87,7 @@
    (listen-socket)
    (listen-fd)
    (number-of-threads :initarg :number-of-threads :initform 2)
-   (handler :initarg :handler :initform (make-instance 'sendfile-handler))))
+   (handler :initarg :handler :initform (make-instance 'default-handler))))
 
 (defvar *server*)
 (defvar *fd-hash*)
@@ -175,8 +177,11 @@
     (setf end (position #.(char-code #\space) buffer :start (incf end)))
     (let ((request-uri (sb-ext:octets-to-string buffer :start start :end end)))
       (setf (gethash "REQUEST_URI" env) request-uri)
-      (let ((? (position #\? buffer :start start :end end)))
-        (setf (gethash "QUERY_STRING" env) (if ? (subseq request-uri (1+ ?)) ""))
+      (let ((? (position #.(char-code #\?) buffer :start start :end end)))
+        (setf (gethash "QUERY_STRING" env)
+              (if ?
+                  (sb-ext:octets-to-string buffer :start (1+ ?) :end end)
+                  ""))
         (setf (gethash "PATH_INFO" env) (nurl-decode buffer start (or ? end)))))
     (setf start (incf end))
     (setf end (position #.(char-code #\cr) buffer :start start))
@@ -211,7 +216,7 @@
   (with-slots (document-root handler) server
     (let ((*env* (gethash fd *fd-hash*)))
       (when *env*
-        (multiple-value-call #'%send-response (call handler *env*))))
+        (handle-request handler server fd *env*)))
     (close-connection server fd)))
 
 (defun status-message (status)
@@ -228,31 +233,33 @@
 (defmacro with-cork ((fd) &body body)
   "sendfile の前のレスポンスヘッダを小分けで送らないために TCP_CROK"
   (alexandria:once-only (fd)
-   `(progn
-      (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
-                                            iolib.sockets::tcp-cork 1)
-      ,@body
-      (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
-                                            iolib.sockets::tcp-cork 0))))
+    `(progn
+       (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
+                                             iolib.sockets::tcp-cork 1)
+       ,@body
+       (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
+                                             iolib.sockets::tcp-cork 0))))
 
-(defun response-file (fd path)
+(defun sendfile (fd path)
   (let* ((file-fd (handler-case (isys::open path isys:o-rdonly)
                     (isys:enoent ()
                       (warn "404 not found ~a" path)
-                      (return-from response-file nil))))
+                      (return-from sendfile nil))))
          (st (isys:fstat file-fd)))
     (with-cork (fd)
-      (cffi:with-foreign-string (s *response-header*)
-        (isys:write fd s (length *response-header*)))
-      (sendfile fd file-fd (cffi-sys:null-pointer) (isys:stat-size st)))
+      (cffi:with-foreign-string ((s length)
+                                 (format nil "HTTP/1.0 200 OK~aLast-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~a"
+                                         +crlf+ +crlf+ +crlf+))
+            (isys:write fd s length))
+      (%sendfile fd file-fd (cffi-sys:null-pointer) (isys:stat-size st)))
     (isys:close file-fd)
     t))
 
 (defun %send-response (status headers body)
   (let ((fd (gethash :fd *env*)))
     (aif (cdr (assoc "X-Sendfile" headers :test #'equal))
-         (unless (response-file fd it)
-           (multiple-value-call #'%send-response (response-404 t *env*)))
+         (unless (sendfile fd it)
+           (error "X-Sendfile not found"))
          (with-cork (fd)
            (write-response (format nil "HTTP/1.0 ~d ~a~a" status (status-message status) +crlf+))
            (write-response (collect-append
@@ -260,7 +267,9 @@
                             (multiple-value-bind (k v) (scan-alist headers #'equal)
                               (format nil "~a: ~a~a" k v +crlf+))))
            (write-response +crlf+)
-           (collect-ignore (write-response (scan body)))))))
+           (collect-ignore (write-response (scan body)))
+           t))))
+
 
 (defmethod close-connection (server fd)
   (remhash fd *fd-hash*)
@@ -268,40 +277,85 @@
   (isys:close fd))
 
 (defmethod response-404 (handler env)
-  (values 404 () (list "Not Found. " (gethash "PATH_INFO" env))))
+  (values ))
+
 
 (defclass sendfile-handler ()
   ())
 
-(defmethod call ((handler sendfile-handler) env)
-  (let ((path (gethash "PATH_INFO" env)))
-    (let ((full-path (concatenate 'string (gethash "DOCUMENT_ROOT" env)  path)))
-      (if (and (fad:file-exists-p full-path)
-               (not (fad:directory-exists-p full-path)))
-          (values 200 `(("X-Sendfile" . ,full-path)) nil)
-          (response-404 handler env)))))
+(defmethod handle-request or ((handler sendfile-handler) server fd env)
+  (let* ((path (concatenate 'string
+                             (gethash "DOCUMENT_ROOT" env)
+                             (gethash "PATH_INFO" env))))
+    (when (and (fad:file-exists-p path)
+               (not (fad:directory-exists-p path)))
+      (sendfile fd path))))
 
-
-(defclass lisp-handler (sendfile-handler)
+(defclass 404-handler ()
   ())
 
-(defmethod call ((handler lisp-handler) env)
-  (multiple-value-bind (status headers body) (call-next-method)
-    (if (= 404 status)
-        (values 200
-                `(("Content-Type" . "text/html; charset=UTF-8"))
-                (list "<ul>"
-                      (collect-append 'string
-                                      (multiple-value-bind (k v) (scan-hash  env)
-                                        (format nil "<li>~a . ~a</li>" k v)))
-                      "</ul>"))
-        (values status headers body))))
+(defun h (s)
+  (with-output-to-string (out)
+    (iterate ((c (scan 'string s)))
+      (princ (case c
+               (#\& "&amp;")
+               (#\< "&lt;")
+               (#\> "&gt;")
+               (#\" "&quot;")
+               (t c))
+             out))))
 
+(defmethod handle-request or ((handler 404-handler) server fd env)
+  (%send-response 404 `(("Content-type" . "text/html"))
+                  (list "<html>
+<head><title>not found</title></head>
+<body>Not Found. " (h (gethash "PATH_INFO" env)) "</body></html>")))
+
+
+(defclass app-handler ()
+  ((app :initarg :app :initform (make-instance 'env-dum-app))))
+
+(defmethod handle-request or ((handler app-handler) server fd env)
+  (multiple-value-call #'%send-response (call handler *env*)))
+
+
+(defclass env-dump-app ()
+  ())
+
+(defmethod call ((aap env-dump-app) env)
+  (values 200
+          `(("Content-Type" . "text/html; charset=UTF-8"))
+           (list "<ul>"
+                 (collect-append 'string
+                                  (multiple-value-bind (k v) (scan-hash  env)
+                                    (format nil "<li>~a . ~a</li>" k v)))
+                 "</ul>")))
+
+
+(defclass cgi-handler ()
+  ())
+
+(defmethod handle-request or ((handler cgi-handler) server fd env)
+  (let ((path (concatenate 'string (gethash "DOCUMENT_ROOT" env)
+                           (gethash "PATH_INFO" env))))
+    (when (alexandria:ends-with-subseq ".cgi" path :test #'equal)
+      (let ((body (with-output-to-string (body)
+                    (sb-ext:run-program
+                     "/bin/sh" (list path)
+                     :output body
+                     :environment (collect 'bag
+                                    (multiple-value-bind (k v) (scan-hash env)
+                                      (format nil "~a=~a" k v)))))))
+        (write-response (format nil "HTTP/1.0 200 OK~a" +crlf+))
+        (write-response body)
+        t))))
+
+(defclass default-handler (cgi-handler sendfile-handler 404-handler)
+  ())
 
 #|
 (info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server))
-(info.read-eval-print.httpd:start
- (make-instance 'info.read-eval-print.httpd:server
-                :handler (make-instance 'info.read-eval-print.httpd::lisp-handler)))
+(info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server
+                                                 :document-root "/tmp"))
 ab -n 10000 -c 10 'http://localhost:1958/sbcl-doc/html/index.html'
 |#
