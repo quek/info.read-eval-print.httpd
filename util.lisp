@@ -70,3 +70,44 @@
   (aif (position #\. path :from-end t)
        (mime-type (subseq path (1+ it)))
        "application/octet-stream"))
+
+
+(alexandria:define-constant +week-names+ #("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun")
+  :test #'equalp)
+
+(alexandria:define-constant +month-names+ #("Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul"
+                                            "Aug" "Sep" "Oct" "Nov" "Dec")
+  :test #'equalp)
+
+(defmacro %rfc-2822 (time)
+  `(multiple-value-bind (second minute hour date month year day daylight-p zone) ,time
+     (declare (ignore daylight-p))
+     (format nil "~a, ~02,'0d ~a ~04,'0d ~02,'0d:~02,'0d:~02,'0d ~a~02,'0d00"
+             (aref +week-names+ day)
+             date
+             (aref +month-names+ (1- month))
+             year
+             hour
+             minute
+             second
+             (if (minusp zone) "+" "-")
+             (abs zone))))
+
+(declaim (inline rfc-2822-now))
+(defun rfc-2822-now ()
+  "Sun, 19 Aug 2012 13:14:43 +0000"
+  (%rfc-2822 (get-decoded-time)))
+
+(declaim (inline rfc-2822))
+(defun rfc-2822 (universal-time)
+  "Sun, 19 Aug 2012 13:14:43 +0000"
+  (%rfc-2822 (decode-universal-time universal-time)))
+
+(defconstant +posix-epoch+ (encode-universal-time 0 0 0 1 1 1970 0))
+
+(declaim (inline rfc-2822-posix))
+(defun rfc-2822-posix (posix-time)
+  (%rfc-2822 (decode-universal-time (+ posix-time +posix-epoch+))))
+
+
+

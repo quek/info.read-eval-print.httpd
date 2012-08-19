@@ -7,5 +7,4 @@
   :depends-on (:iolib
                :cl-fad
                :anaphora
-               :simple-date-time
                :info.read-eval-print.series-ext))

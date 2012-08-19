@@ -95,22 +95,23 @@
 (defvar *epoll-fd*)
 (defvar *buffer*)
 
-(defun add-timer (env function delay)
-  (let ((timer (iomux::make-timer function delay :one-shot t)))
-    (setf (gethash :keep-alive-timer env) timer)
-    (iomux::schedule-timer *timers* timer)))
+(defun set-keep-alive-timer (fd env)
+  (when (and (keep-alive-p env) (not (gethash :keep-alive-timer env)))
+    (let ((timer (iomux::make-timer
+                  (lambda ()
+                    (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
+                    (close-connection *server* fd))
+                  (slot-value *server* 'keep-alive-timeout)
+                  :one-shot t)))
+      (setf (gethash :keep-alive-timer env) timer)
+      (iomux::schedule-timer *timers* timer))))
 
 (defun add-to-wait (pipe-fd)
   (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
     (let ((fd (cffi:mem-aref buf :int 0))
           (env (make-hash-table :test #'equal)))
       (setf (gethash fd *fd-hash*) env)
-      (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet)
-      (add-timer env
-                 (lambda ()
-                   (print "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                   (close-connection *server* fd))
-                 (slot-value *server* 'keep-alive-timeout)))))
+      (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))
 
 (defun dispatch-epoll-event (fd event)
   (let ((event-mask (cffi:foreign-slot-value event 'isys:epoll-event 'isys:events)))
@@ -205,11 +206,12 @@
 (defmethod parse-request (server fd buffer buffer-size env)
   (prog ()
      (remhash :remain-request-buffer env)
-     :start
+   :start
      (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size env)
        (if ok
            (progn
              (normalize-env server env buffer position fd)
+             (set-keep-alive-timer fd env)
              (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
            (let ((remain-size (- buffer-size position)))
              (cond ((zerop position)
@@ -251,15 +253,17 @@
 
 (defvar *env*)
 
-(defun keep-alive-p ()
+(defun keep-alive-p (env)
   ;; TODO Connection ヘッダ
-  (plusp (slot-value *server* 'keep-alive-timeout)))
+  (and
+   (equal (gethash "SERVER_PROTOCOL" env) "HTTP/1.1")
+   (plusp (slot-value *server* 'keep-alive-timeout))))
 
 (defmethod send-response (server fd)
   (with-slots (document-root handler) server
     (let ((*env* (gethash fd *fd-hash*)))
       (handle-request handler server fd *env*)
-      (if (keep-alive-p)
+      (if (keep-alive-p *env*)
           (progn
             (remhash :parse-function *env*)
             (remhash :remain-request-buffer *env*)
@@ -276,10 +280,15 @@
     (404 "Not Found")
     (t "que")))
 
-(defun write-response (string)
+(defmethod write-response ((string string))
   (let ((fd (gethash :fd *env*)))
     (cffi:with-foreign-string ((s length) string :encoding :utf-8 :null-terminated-p nil)
       (isys:write fd s length))))
+
+(defmethod write-response (vector)
+  (let ((fd (gethash :fd *env*)))
+    (cffi-sys:with-pointer-to-vector-data (pointer vector)
+      (isys:write fd pointer (length vector)))))
 
 (defmacro with-cork ((fd) &body body)
   "sendfile の前のレスポンスヘッダを小分けで送らないために TCP_CROK"
@@ -297,7 +306,7 @@
                       (warn "404 not found ~a" path)
                       (return-from sendfile nil))))
          (st (isys:fstat file-fd))
-         (last-modified (dt:rfc-2822 (dt:from-posix-time (isys:stat-mtime st))))
+         (last-modified (rfc-2822-posix (isys:stat-mtime st)))
          (content-length (isys:stat-size st)))
     (with-cork (fd)
       (cffi:with-foreign-string ((s length)
@@ -310,7 +319,7 @@ Last-modified: ~a~a~
                                          +crlf+
                                          (path-mime-type path) +crlf+
                                          content-length +crlf+
-                                         (dt:rfc-2822 (dt:now)) +crlf+
+                                         (rfc-2822-now) +crlf+
                                          last-modified +crlf+
                                          +crlf+)
                                  :null-terminated-p nil)
@@ -337,8 +346,8 @@ Last-modified: ~a~a~
 
 (defmethod close-connection (server fd)
   (let ((env (gethash fd *fd-hash*)))
-    (when env
-      (iomux::unschedule-timer *timers* (gethash :keep-alive-timer env))))
+    (awhen (and env (gethash :keep-alive-timer env))
+      (iomux::unschedule-timer *timers* it)))
   (remhash fd *fd-hash*)
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
   (isys:close fd))
@@ -362,11 +371,13 @@ Last-modified: ~a~a~
   ())
 
 (defmethod handle-request or ((handler 404-handler) server fd env)
-  (%send-response 404 `(("Content-type" . "text/html")
-                        ("Date" . ,(dt:rfc-2822 (dt:now))))
-                  (list "<html>
+  (let ((body (string-to-octets (concatenate 'string "<html>
 <head><title>not found</title></head>
-<body>Not Found. " (h (gethash "PATH_INFO" env)) "</body></html>")))
+<body>Not Found. " (h (gethash "PATH_INFO" env)) "</body></html>"))))
+    (%send-response 404 `(("Content-type" . "text/html")
+                          ("Date" . ,(rfc-2822-now))
+                          ("Content-Length" . ,(length body)))
+                    (list body))))
 
 
 (defclass app-handler ()
