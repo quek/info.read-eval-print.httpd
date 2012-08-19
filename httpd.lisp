@@ -176,13 +176,13 @@
       (setf (gethash "PATH_INFO" env) (subseq request-uri 0 ?))
       (setf (gethash "QUERY_STRING" env) (if ? (subseq request-uri (1+ ?)) "")))
     (setf (gethash :fd env) fd)
-    #+nil
     (iterate (((k v) (scan-hash env)))
       (format t "~a: ~a~%" k v))
     env))
 
 (defmethod parse-request (server fd buffer buffer-size env)
   (prog ()
+     (remhash :remain-request-buffer env)
      :start
      (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size env)
        (print (list ok position))

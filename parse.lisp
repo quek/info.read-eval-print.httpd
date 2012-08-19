@@ -51,7 +51,7 @@
       (error 'invalid-request))
     (let ((name (octets-to-string buffer :start start :end colon))
           (value (octets-to-string buffer :start (1+ colon) :end end)))
-      (setf (gethash (concatenate 'string "HTTP_" name) env)
+      (setf (gethash (concatenate 'string "HTTP_" (substitute #\_ #\- (string-upcase name))) env)
             (string-left-trim #(#\space) value)))))
 
 (defun parse-header (buffer start end env)
