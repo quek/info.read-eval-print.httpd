@@ -66,8 +66,6 @@
                  (progn (setf (aref buffer j) code)
                         (incf i))))))
 
-(defparameter *default-buffer-size* 10)
-
 (defgeneric start (server))
 (defgeneric stop (server))
 
@@ -86,7 +84,8 @@
    (bind-address :initarg :bind-address :initform "0.0.0.0")
    (listen-socket)
    (listen-fd)
-   (number-of-threads :initarg :number-of-threads :initform 2)
+   (number-of-threads :initarg :number-of-threads :initform 1)
+   (default-buffer-size :initarg :default-buffer-size :initform 10)
    (handler :initarg :handler :initform (make-instance 'default-handler))))
 
 (defvar *server*)
@@ -113,7 +112,7 @@
   (let ((*server* server)
         (*fd-hash* fd-hash)
         (*epoll-fd* epoll-fd)
-        (*buffer* (make-array *default-buffer-size* :element-type '(unsigned-byte 8))))
+        (*buffer* (make-array (slot-value server 'default-buffer-size) :element-type '(unsigned-byte 8))))
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
       (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
       (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+ 10000)

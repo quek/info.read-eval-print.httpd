@@ -68,7 +68,7 @@
                 (store-header buffer start it env)
                 (setf start (1+ it))
                 (go :start)))
-          (return (values nil start #'parse-header)))))
+          (return (values nil (1- start) #'parse-header)))))
 
 (defun parse-header-end (buffer start end env)
   (declare (ignore env))
