@@ -86,18 +86,31 @@
    (listen-fd)
    (number-of-threads :initarg :number-of-threads :initform 1)
    (default-buffer-size :initarg :default-buffer-size :initform 10)
-   (handler :initarg :handler :initform (make-instance 'default-handler))))
+   (handler :initarg :handler :initform (make-instance 'default-handler))
+   (keep-alive-timeout :initarg :keep-alive-timer :initform 10)))
 
 (defvar *server*)
 (defvar *fd-hash*)
+(defvar *timers*)
 (defvar *epoll-fd*)
 (defvar *buffer*)
 
+(defun add-timer (env function delay)
+  (let ((timer (iomux::make-timer function delay :one-shot t)))
+    (setf (gethash :keep-alive-timer env) timer)
+    (iomux::schedule-timer *timers* timer)))
+
 (defun add-to-wait (pipe-fd)
-  (cffi:with-foreign-object (buf :int)
-    (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
-    (let ((fd (cffi:mem-aref buf :int 0)))
-      (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))
+  (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
+    (let ((fd (cffi:mem-aref buf :int 0))
+          (env (make-hash-table :test #'equal)))
+      (setf (gethash fd *fd-hash*) env)
+      (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet)
+      (add-timer env
+                 (lambda ()
+                   (print "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                   (close-connection *server* fd))
+                 (slot-value *server* 'keep-alive-timeout)))))
 
 (defun dispatch-epoll-event (fd event)
   (let ((event-mask (cffi:foreign-slot-value event 'isys:epoll-event 'isys:events)))
@@ -108,37 +121,45 @@
           ((plusp (logand event-mask isys:epollhup))
            (close-connection *server* fd)))))
 
-(defun start-handler-thread (server fd-hash epoll-fd pipe-fd)
+;; (declaim (inline handle-events))
+(defun handle-events (events ready-fds pipe-fd)
+  (loop for i below ready-fds
+        for event = (cffi:mem-aref events 'isys:epoll-event i)
+        for event-fd = (cffi:foreign-slot-value
+                        (cffi:foreign-slot-value event 'isys:epoll-event 'isys:data)
+                        'isys:epoll-data 'isys:fd)
+        if (= event-fd pipe-fd)
+          do (add-to-wait pipe-fd)
+        else
+          do (dispatch-epoll-event event-fd event))
+  (iomux::expire-pending-timers *timers* (isys:get-monotonic-time)))
+
+(defun start-handler-thread (server fd-hash timers epoll-fd pipe-fd)
   (let ((*server* server)
         (*fd-hash* fd-hash)
+        (*timers* timers)
         (*epoll-fd* epoll-fd)
         (*buffer* (make-array (slot-value server 'default-buffer-size) :element-type '(unsigned-byte 8))))
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
       (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
-      (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+ 10000)
+      (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+
+                                                           500)
                               (isys:eintr ()
                                 (warn "epoll-wait EINTR")
                                 0))
-            do (loop for i below ready-fds
-                     for event = (cffi:mem-aref events 'isys:epoll-event i)
-                     for event-fd = (cffi:foreign-slot-value
-                                     (cffi:foreign-slot-value event 'isys:epoll-event 'isys:data)
-                                     'isys:epoll-data 'isys:fd)
-                     if (= event-fd pipe-fd)
-                       do (add-to-wait pipe-fd)
-                     else
-                       do (dispatch-epoll-event event-fd event))))))
+            do (handle-events events ready-fds pipe-fd)))))
 
 (defun start-accept-thread (server)
   (let ((*server* server)
         (*fd-hash* (make-hash-table))
+        (*timers* (iomux::make-priority-queue :key #'iomux::%timer-expire-time))
         (*epoll-fd* (isys:epoll-create 1)))
     (multiple-value-bind (pipe-read pipe-write) (sb-posix:pipe)
       (epoll-ctl pipe-read *epoll-fd* isys:epoll-ctl-add isys:epollin)
       (sb-thread:make-thread #'start-handler-thread
                              :name (format nil "handler of ~a"
                                            (sb-thread:thread-name sb-thread:*current-thread*))
-                             :arguments (list *server* *fd-hash* *epoll-fd* pipe-read))
+                             :arguments (list *server* *fd-hash* *timers* *epoll-fd* pipe-read))
       (cffi:with-foreign-object (buf :int)
         (loop with listen-fd = (slot-value server 'listen-fd)
               for client-fd = (iolib.sockets::with-sockaddr-storage-and-socklen (ss size)
@@ -176,6 +197,7 @@
       (setf (gethash "PATH_INFO" env) (subseq request-uri 0 ?))
       (setf (gethash "QUERY_STRING" env) (if ? (subseq request-uri (1+ ?)) "")))
     (setf (gethash :fd env) fd)
+    #+nil
     (iterate (((k v) (scan-hash env)))
       (format t "~a: ~a~%" k v))
     env))
@@ -185,7 +207,6 @@
      (remhash :remain-request-buffer env)
      :start
      (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size env)
-       (print (list ok position))
        (if ok
            (progn
              (normalize-env server env buffer position fd)
@@ -206,6 +227,7 @@
                       (setf buffer-size (+ read-size remain-size))
                       (go :start)))
                    (t
+                    ;; TODO この場合も上と同じように *buffer* を大きくする。
                     (memmove buffer position buffer-size)
                     (let ((read-size (receive fd buffer remain-size (length buffer))))
                       (unless read-size
@@ -216,8 +238,7 @@
 
 
 (defmethod receive-request (server fd)
-  (let* ((env (sor (gethash fd *fd-hash*)
-                   (setf it (make-hash-table :test #'equal))))
+  (let* ((env (gethash fd *fd-hash*))
          (start (let* ((buf (gethash :remain-request-buffer env #()))
                        (len (length buf)))
                   (iterate ((i (scan-range :length len)))
@@ -230,12 +251,24 @@
 
 (defvar *env*)
 
+(defun keep-alive-p ()
+  ;; TODO Connection ヘッダ
+  (plusp (slot-value *server* 'keep-alive-timeout)))
+
 (defmethod send-response (server fd)
   (with-slots (document-root handler) server
     (let ((*env* (gethash fd *fd-hash*)))
-      (when *env*
-        (handle-request handler server fd *env*)))
-    (close-connection server fd)))
+      (handle-request handler server fd *env*)
+      (if (keep-alive-p)
+          (progn
+            (remhash :parse-function *env*)
+            (remhash :remain-request-buffer *env*)
+            (iterate (((k v) (scan-hash *env*)))
+              (declare (ignore v))
+              (when (stringp k)
+                (remhash k *env*)))
+            (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet))
+          (close-connection server fd)))))
 
 (defun status-message (status)
   (case status
@@ -263,18 +296,23 @@
                     (isys:enoent ()
                       (warn "404 not found ~a" path)
                       (return-from sendfile nil))))
-         (content-length (isys:stat-size (isys:fstat file-fd))))
+         (st (isys:fstat file-fd))
+         (last-modified (dt:rfc-2822 (dt:from-posix-time (isys:stat-mtime st))))
+         (content-length (isys:stat-size st)))
     (with-cork (fd)
       (cffi:with-foreign-string ((s length)
-                                 (format nil "HTTP/1.0 200 OK~a~
+                                 (format nil "HTTP/1.1 200 OK~a~
 Content-Type: ~a~a~
 Content-Length: ~d~a~
-Last-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~
+Date: ~a~a~
+Last-modified: ~a~a~
 ~a"
                                          +crlf+
                                          (path-mime-type path) +crlf+
                                          content-length +crlf+
-                                         +crlf+ +crlf+)
+                                         (dt:rfc-2822 (dt:now)) +crlf+
+                                         last-modified +crlf+
+                                         +crlf+)
                                  :null-terminated-p nil)
         (isys:write fd s length))
       (%sendfile fd file-fd (cffi-sys:null-pointer) content-length))
@@ -287,7 +325,7 @@ Last-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~
          (unless (sendfile fd it)
            (error "X-Sendfile not found"))
          (with-cork (fd)
-           (write-response (format nil "HTTP/1.0 ~d ~a~a" status (status-message status) +crlf+))
+           (write-response (format nil "HTTP/1.1 ~d ~a~a" status (status-message status) +crlf+))
            (write-response (collect-append
                             'string
                             (multiple-value-bind (k v) (scan-alist headers #'equal)
@@ -298,6 +336,9 @@ Last-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~
 
 
 (defmethod close-connection (server fd)
+  (let ((env (gethash fd *fd-hash*)))
+    (when env
+      (iomux::unschedule-timer *timers* (gethash :keep-alive-timer env))))
   (remhash fd *fd-hash*)
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
   (isys:close fd))
@@ -321,7 +362,8 @@ Last-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~
   ())
 
 (defmethod handle-request or ((handler 404-handler) server fd env)
-  (%send-response 404 `(("Content-type" . "text/html"))
+  (%send-response 404 `(("Content-type" . "text/html")
+                        ("Date" . ,(dt:rfc-2822 (dt:now))))
                   (list "<html>
 <head><title>not found</title></head>
 <body>Not Found. " (h (gethash "PATH_INFO" env)) "</body></html>")))
@@ -359,9 +401,11 @@ Last-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~
                      "/bin/sh" (list path)
                      :output body
                      :environment (collect 'bag
-                                    (multiple-value-bind (k v) (scan-hash env)
-                                      (format nil "~a=~a" k v)))))))
-        (write-response (format nil "HTTP/1.0 200 OK~a" +crlf+))
+                                    (choose
+                                     (multiple-value-bind (k v) (scan-hash env)
+                                       (when (stringp k)
+                                         (format nil "~a=~a" k v)))))))))
+        (write-response (format nil "HTTP/1.1 200 OK~a" +crlf+))
         (write-response body)
         t))))
 
