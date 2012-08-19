@@ -266,9 +266,13 @@
          (st (isys:fstat file-fd)))
     (with-cork (fd)
       (cffi:with-foreign-string ((s length)
-                                 (format nil "HTTP/1.0 200 OK~aLast-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~a"
-                                         +crlf+ +crlf+ +crlf+))
-            (isys:write fd s length))
+                                 (format nil "HTTP/1.0 200 OK~aContent-Type: ~a~aContent-Length: ~a~aLast-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~a"
+                                         +crlf+
+                                         (path-mime-type path) +crlf+
+                                         (isys:stat-size st) +crlf+
+                                         +crlf+ +crlf+)
+                                 :null-terminated-p nil)
+        (isys:write fd s length))
       (%sendfile fd file-fd (cffi-sys:null-pointer) (isys:stat-size st)))
     (isys:close file-fd)
     t))

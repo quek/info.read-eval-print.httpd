@@ -48,3 +48,25 @@
                (#\" "&quot;")
                (t c))
              out))))
+
+(defparameter *mime-types*
+  (alexandria:alist-hash-table
+   `(("html" . "text/html")
+     ("htm" . "text/html")
+     ("txt" . "text/plain")
+     ("png" . "image/png")
+     ("gif" . "image/gif")
+     ("jpeg" . "image/jpeg")
+     ("jpg" . "image/jpeg")
+     ("pdf" . "application/pdf")
+     ("ps" . "application/postscript")
+     ("zip" . "application/zip"))
+   :test #'equalp))
+
+(defun mime-type (type)
+  (gethash type *mime-types* "application/octet-stream"))
+
+(defun path-mime-type (path)
+  (aif (position #\. path :from-end t)
+       (mime-type (subseq path (1+ it)))
+       "application/octet-stream"))
