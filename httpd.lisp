@@ -263,17 +263,21 @@
                     (isys:enoent ()
                       (warn "404 not found ~a" path)
                       (return-from sendfile nil))))
-         (st (isys:fstat file-fd)))
+         (content-length (isys:stat-size (isys:fstat file-fd))))
     (with-cork (fd)
       (cffi:with-foreign-string ((s length)
-                                 (format nil "HTTP/1.0 200 OK~aContent-Type: ~a~aContent-Length: ~a~aLast-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~a"
+                                 (format nil "HTTP/1.0 200 OK~a~
+Content-Type: ~a~a~
+Content-Length: ~d~a~
+Last-modified: Thu, 1 Jan 1970 00:00:00 GMT~a~
+~a"
                                          +crlf+
                                          (path-mime-type path) +crlf+
-                                         (isys:stat-size st) +crlf+
+                                         content-length +crlf+
                                          +crlf+ +crlf+)
                                  :null-terminated-p nil)
         (isys:write fd s length))
-      (%sendfile fd file-fd (cffi-sys:null-pointer) (isys:stat-size st)))
+      (%sendfile fd file-fd (cffi-sys:null-pointer) content-length))
     (isys:close file-fd)
     t))
 
