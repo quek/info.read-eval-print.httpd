@@ -115,11 +115,11 @@
 
 (defun dispatch-epoll-event (fd event)
   (let ((event-mask (cffi:foreign-slot-value event 'isys:epoll-event 'isys:events)))
-    (cond ((plusp (logand event-mask isys:epollin) )
+    (cond ((logtest event-mask isys:epollin)
            (receive-request *server* fd))
-          ((plusp (logand event-mask isys:epollout))
+          ((logtest event-mask isys:epollout)
            (send-response *server* fd))
-          ((plusp (logand event-mask isys:epollhup))
+          ((logtest event-mask isys:epollhup)
            (close-connection *server* fd)))))
 
 ;; (declaim (inline handle-events))
