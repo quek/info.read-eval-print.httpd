@@ -34,7 +34,9 @@
                                               length
                                               0
                                               (cffi:null-pointer)
-                                              (cffi:null-pointer))))))
+                                              (cffi:null-pointer))
+        (iolib.syscalls:ewouldblock ()
+          nil)))))
 
 (defun h (s)
   (with-output-to-string (out)

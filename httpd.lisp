@@ -143,7 +143,8 @@
         (loop with listen-fd = (slot-value server 'listen-fd)
               for client-fd = (iolib.sockets::with-sockaddr-storage-and-socklen (ss size)
                                 (iolib.sockets::%accept listen-fd ss size))
-              do (setf (cffi:mem-aref buf :int 0) client-fd)
+              do (setf (isys:fd-nonblock client-fd) t)
+                 (setf (cffi:mem-aref buf :int 0) client-fd)
                  (sb-posix:write pipe-write buf #.(cffi:foreign-type-size :int)))))))
 
 (defmethod start (server)
@@ -198,12 +199,18 @@
                         (setf (aref new-buffer i) (aref buffer i)))
                       (setf *buffer* new-buffer))
                     (let ((read-size (receive fd *buffer* remain-size (length *buffer*))))
+                      (unless read-size
+                        (setf (gethash :remain-request-buffer env) (subseq *buffer* 0 remain-size))
+                        (return))
                       (setf buffer *buffer*)
                       (setf buffer-size (+ read-size remain-size))
                       (go :start)))
                    (t
                     (memmove buffer position buffer-size)
                     (let ((read-size (receive fd buffer remain-size (length buffer))))
+                      (unless read-size
+                        (setf (gethash :remain-request-buffer env) (subseq buffer 0 remain-size))
+                        (return))
                       (setf buffer-size (+ read-size remain-size))
                       (go :start)))))))))
 
@@ -211,9 +218,14 @@
 (defmethod receive-request (server fd)
   (let* ((env (sor (gethash fd *fd-hash*)
                    (setf it (make-hash-table :test #'equal))))
-         (read-size (receive fd *buffer* 0 (length *buffer*))))
+         (start (let* ((buf (gethash :remain-request-buffer env #()))
+                       (len (length buf)))
+                  (iterate ((i (scan-range :length len)))
+                    (setf (aref *buffer* i) (aref buf i)))
+                  len))
+         (read-size (receive fd *buffer* start (length *buffer*))))
     (if (plusp read-size)
-        (parse-request server fd *buffer* read-size env)
+        (parse-request server fd *buffer* (+ start read-size) env)
         (close-connection server fd))))
 
 (defvar *env*)
