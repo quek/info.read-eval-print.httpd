@@ -195,6 +195,7 @@
     (setf (gethash "DOCUMENT_ROOT" env) document-root)
     (let* ((request-uri (gethash "REQUEST_URI" env))
            (? (position #\? request-uri :start 1)))
+      (setf (gethash "SCRIPT_NAME" env) "")
       (setf (gethash "PATH_INFO" env) (subseq request-uri 0 ?))
       (setf (gethash "QUERY_STRING" env) (if ? (subseq request-uri (1+ ?)) "")))
     (setf (gethash :fd env) fd)
