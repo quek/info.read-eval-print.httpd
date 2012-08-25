@@ -2,8 +2,6 @@
 
 (defconstant epollet (ash 1 31))
 
-(alexandria:define-constant +crlf+ (format nil "~c~c" #\cr #\lf) :test #'equalp)
-
 (defun epoll-ctl (fd epfd op &rest events)
   (cffi:with-foreign-object (ev 'isys:epoll-event)
     (isys:bzero ev isys:size-of-epoll-event)
@@ -71,7 +69,6 @@
 
 (defgeneric handle-request (handler server fd env)
   (:method-combination or))
-(defgeneric call (handler env))
 
 (defgeneric accept (server))
 (defgeneric receive-request (server fd))
@@ -247,7 +244,9 @@
                   (iterate ((i (scan-range :length len)))
                     (setf (aref *buffer* i) (aref buf i)))
                   len))
-         (read-size (receive fd *buffer* start (length *buffer*))))
+         (read-size (handler-case (receive fd *buffer* start (length *buffer*))
+                      (iolib.syscalls:econnreset ()
+                        -1))))
     (if (plusp read-size)
         (parse-request server fd *buffer* (+ start read-size) env)
         (close-connection server fd))))
@@ -379,26 +378,6 @@ Last-modified: ~a~a~
                           ("Date" . ,(rfc-2822-now))
                           ("Content-Length" . ,(length body)))
                     (list body))))
-
-
-(defclass app-handler ()
-  ((app :initarg :app :initform (make-instance 'env-dum-app))))
-
-(defmethod handle-request or ((handler app-handler) server fd env)
-  (multiple-value-call #'%send-response (call handler *env*)))
-
-
-(defclass env-dump-app ()
-  ())
-
-(defmethod call ((aap env-dump-app) env)
-  (values 200
-          `(("Content-Type" . "text/html; charset=UTF-8"))
-           (list "<ul>"
-                 (collect-append 'string
-                                  (multiple-value-bind (k v) (scan-hash  env)
-                                    (format nil "<li>~a . ~a</li>" k v)))
-                 "</ul>")))
 
 
 (defclass cgi-handler ()

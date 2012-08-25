@@ -1,5 +1,7 @@
 (in-package :info.read-eval-print.httpd)
 
+(alexandria:define-constant +crlf+ (format nil "~c~c" #\cr #\lf) :test #'equalp)
+
 (defun string-to-octets (string &key (external-format :utf-8)
                                   (start 0) end null-terminate)
   (sb-ext:string-to-octets string :external-format external-format
