@@ -218,30 +218,21 @@
                (normalize-request server request buffer position fd)
                (set-keep-alive-timer fd request)
                (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
-             (let ((remain-size (- buffer-size position)))
-               (cond ((zerop position)
-                      ;; buffer full
-                      (let* ((new-buffer-size (* 2 (length buffer)))
-                             (new-buffer (make-array new-buffer-size :element-type '(unsigned-byte 8))))
-                        (iterate ((i (scan-range :below buffer-size)))
-                          (setf (aref new-buffer i) (aref buffer i)))
-                        (setf *buffer* new-buffer))
-                      (let ((read-size (receive fd *buffer* remain-size (length *buffer*))))
-                        (unless read-size
-                          (setf remain-request-buffer (subseq *buffer* 0 remain-size))
-                          (return))
-                        (setf buffer *buffer*)
-                        (setf buffer-size (+ read-size remain-size))
-                        (go :start)))
-                     (t
-                      ;; TODO この場合も上と同じように *buffer* を大きくする。
-                      (memmove buffer position buffer-size)
-                      (let ((read-size (receive fd buffer remain-size (length buffer))))
-                        (unless read-size
-                          (setf remain-request-buffer (subseq buffer 0 remain-size))
-                          (return))
-                        (setf buffer-size (+ read-size remain-size))
-                        (go :start))))))))))
+             ;; TODO buffer の上限。
+             (let* ((remain-size (- buffer-size position))
+                    (new-buffer-size (* 2 (length buffer)))
+                    (new-buffer (make-array new-buffer-size :element-type '(unsigned-byte 8))))
+               (iterate ((si (scan-range :from position :below buffer-size))
+                         (di (scan-range)))
+                 (setf (aref new-buffer di) (aref buffer si)))
+               (setf *buffer* new-buffer)
+               (let ((read-size (receive fd *buffer* remain-size new-buffer-size)))
+                 (unless read-size
+                   (setf remain-request-buffer (subseq *buffer* 0 remain-size))
+                   (return))
+                 (setf buffer new-buffer)
+                 (setf buffer-size (+ read-size remain-size))
+                 (go :start))))))))
 
 
 (defmethod receive-request (server fd)
