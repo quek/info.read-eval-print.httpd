@@ -67,7 +67,7 @@
 (defgeneric start (server))
 (defgeneric stop (server))
 
-(defgeneric handle-request (handler server fd env)
+(defgeneric handle-request (handler server fd request)
   (:method-combination or))
 
 (defgeneric accept (server))
@@ -91,24 +91,29 @@
 (defvar *timers*)
 (defvar *epoll-fd*)
 (defvar *buffer*)
+(defvar *accept-thread-fd*)
+(defvar *request*)
 
-(defun set-keep-alive-timer (fd env)
-  (when (and (keep-alive-p env) (not (gethash :keep-alive-timer env)))
-    (let ((timer (iomux::make-timer
-                  (lambda ()
-                    (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
-                    (close-connection *server* fd))
-                  (slot-value *server* 'keep-alive-timeout)
-                  :one-shot t)))
-      (setf (gethash :keep-alive-timer env) timer)
-      (iomux::schedule-timer *timers* timer))))
+(defun set-keep-alive-timer (fd request)
+  (with-slots (keep-alive-timer) request
+    (when (and (keep-alive-p request) (not keep-alive-timer))
+      (let ((timer (iomux::make-timer
+                    (lambda ()
+                      (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
+                      (close-connection *server* fd))
+                    (slot-value *server* 'keep-alive-timeout)
+                    :one-shot t)))
+        (setf keep-alive-timer timer)
+        (iomux::schedule-timer *timers* timer)))))
 
-(defun add-to-wait (pipe-fd)
+(defun add-to-epoll-wait (pipe-fd)
   (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
-    (let ((fd (cffi:mem-aref buf :int 0))
-          (env (make-hash-table :test #'equal)))
-      (setf (gethash fd *fd-hash*) env)
-      (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))
+    (let ((fd (cffi:mem-aref buf :int 0)))
+      (sif (gethash fd *fd-hash*)
+           (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
+           (progn
+             (setf it (make-instance 'request :fd fd))
+             (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))))
 
 (defun dispatch-epoll-event (fd event)
   (let ((event-mask (cffi:foreign-slot-value event 'isys:epoll-event 'isys:events)))
@@ -120,24 +125,25 @@
            (close-connection *server* fd)))))
 
 ;; (declaim (inline handle-events))
-(defun handle-events (events ready-fds pipe-fd)
+(defun handle-events (events ready-fds pipe-read-fd)
   (loop for i below ready-fds
         for event = (cffi:mem-aref events 'isys:epoll-event i)
         for event-fd = (cffi:foreign-slot-value
                         (cffi:foreign-slot-value event 'isys:epoll-event 'isys:data)
                         'isys:epoll-data 'isys:fd)
-        if (= event-fd pipe-fd)
-          do (add-to-wait pipe-fd)
+        if (= event-fd pipe-read-fd)
+          do (add-to-epoll-wait pipe-read-fd)
         else
           do (dispatch-epoll-event event-fd event))
   (iomux::expire-pending-timers *timers* (isys:get-monotonic-time)))
 
-(defun start-handler-thread (server fd-hash timers epoll-fd pipe-fd)
+(defun start-handler-thread (server fd-hash timers epoll-fd pipe-read-fd pipe-write-fd)
   (let ((*server* server)
         (*fd-hash* fd-hash)
         (*timers* timers)
         (*epoll-fd* epoll-fd)
-        (*buffer* (make-array (slot-value server 'default-buffer-size) :element-type '(unsigned-byte 8))))
+        (*buffer* (make-array (slot-value server 'default-buffer-size) :element-type '(unsigned-byte 8)))
+        (*accept-thread-fd* pipe-write-fd))
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
       (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
       (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+
@@ -145,26 +151,27 @@
                               (isys:eintr ()
                                 (warn "epoll-wait EINTR")
                                 0))
-            do (handle-events events ready-fds pipe-fd)))))
+            do (handle-events events ready-fds pipe-read-fd)))))
 
 (defun start-accept-thread (server)
   (let ((*server* server)
         (*fd-hash* (make-hash-table))
         (*timers* (iomux::make-priority-queue :key #'iomux::%timer-expire-time))
         (*epoll-fd* (isys:epoll-create 1)))
-    (multiple-value-bind (pipe-read pipe-write) (sb-posix:pipe)
-      (epoll-ctl pipe-read *epoll-fd* isys:epoll-ctl-add isys:epollin)
+    (multiple-value-bind (pipe-read-fd pipe-write-fd) (sb-posix:pipe)
+      (epoll-ctl pipe-read-fd *epoll-fd* isys:epoll-ctl-add isys:epollin)
       (sb-thread:make-thread #'start-handler-thread
                              :name (format nil "handler of ~a"
                                            (sb-thread:thread-name sb-thread:*current-thread*))
-                             :arguments (list *server* *fd-hash* *timers* *epoll-fd* pipe-read))
+                             :arguments (list *server* *fd-hash* *timers* *epoll-fd*
+                                              pipe-read-fd pipe-write-fd))
       (cffi:with-foreign-object (buf :int)
         (loop with listen-fd = (slot-value server 'listen-fd)
               for client-fd = (iolib.sockets::with-sockaddr-storage-and-socklen (ss size)
                                 (iolib.sockets::%accept listen-fd ss size))
               do (setf (isys:fd-nonblock client-fd) t)
                  (setf (cffi:mem-aref buf :int 0) client-fd)
-                 (sb-posix:write pipe-write buf #.(cffi:foreign-type-size :int)))))))
+                 (sb-posix:write pipe-write-fd buf #.(cffi:foreign-type-size :int)))))))
 
 (defmethod start (server)
   (with-slots (port bind-address listen-socket listen-fd number-of-threads) server
@@ -187,92 +194,79 @@
         (collect-ignore (sb-thread:join-thread (scan 'list threads)))))))
 
 
-(defmethod normalize-env (server env buffer position fd)
+(defmethod normalize-request (server request buffer position fd)
   (with-slots (document-root) server
-    (setf (gethash "DOCUMENT_ROOT" env) document-root)
-    (let* ((request-uri (gethash "REQUEST_URI" env))
+    (setf (env request :document-root) document-root)
+    (let* ((request-uri (env request :request-uri))
            (? (position #\? request-uri :start 1)))
-      (setf (gethash "SCRIPT_NAME" env) "")
-      (setf (gethash "PATH_INFO" env) (subseq request-uri 0 ?))
-      (setf (gethash "QUERY_STRING" env) (if ? (subseq request-uri (1+ ?)) "")))
-    (setf (gethash :fd env) fd)
+      (setf (env request :script-name) "")
+      (setf (env request :path-info) (subseq request-uri 0 ?))
+      (setf (env request :query-string) (if ? (subseq request-uri (1+ ?)) "")))
+    (setf (slot-value request 'fd) fd)
     #+nil
-    (iterate (((k v) (scan-hash env)))
+    (iterate (((k v) (scan-hash (slot-value request 'env))))
       (format t "~a: ~a~%" k v))
-    env))
+    request))
 
-(defmethod parse-request (server fd buffer buffer-size env)
-  (prog ()
-     (remhash :remain-request-buffer env)
-   :start
-     (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size env)
-       (if ok
-           (progn
-             (normalize-env server env buffer position fd)
-             (set-keep-alive-timer fd env)
-             (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
-           (let ((remain-size (- buffer-size position)))
-             (cond ((zerop position)
-                    ;; buffer full
-                    (let* ((new-buffer-size (* 2 (length buffer)))
-                           (new-buffer (make-array new-buffer-size :element-type '(unsigned-byte 8))))
-                      (iterate ((i (scan-range :below buffer-size)))
-                        (setf (aref new-buffer i) (aref buffer i)))
-                      (setf *buffer* new-buffer))
-                    (let ((read-size (receive fd *buffer* remain-size (length *buffer*))))
-                      (unless read-size
-                        (setf (gethash :remain-request-buffer env) (subseq *buffer* 0 remain-size))
-                        (return))
-                      (setf buffer *buffer*)
-                      (setf buffer-size (+ read-size remain-size))
-                      (go :start)))
-                   (t
-                    ;; TODO この場合も上と同じように *buffer* を大きくする。
-                    (memmove buffer position buffer-size)
-                    (let ((read-size (receive fd buffer remain-size (length buffer))))
-                      (unless read-size
-                        (setf (gethash :remain-request-buffer env) (subseq buffer 0 remain-size))
-                        (return))
-                      (setf buffer-size (+ read-size remain-size))
-                      (go :start)))))))))
+(defmethod parse-request (server fd buffer buffer-size request)
+  (with-slots (remain-request-buffer) request
+    (prog ()
+     :start
+       (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size request)
+         (if ok
+             (progn
+               (normalize-request server request buffer position fd)
+               (set-keep-alive-timer fd request)
+               (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
+             (let ((remain-size (- buffer-size position)))
+               (cond ((zerop position)
+                      ;; buffer full
+                      (let* ((new-buffer-size (* 2 (length buffer)))
+                             (new-buffer (make-array new-buffer-size :element-type '(unsigned-byte 8))))
+                        (iterate ((i (scan-range :below buffer-size)))
+                          (setf (aref new-buffer i) (aref buffer i)))
+                        (setf *buffer* new-buffer))
+                      (let ((read-size (receive fd *buffer* remain-size (length *buffer*))))
+                        (unless read-size
+                          (setf remain-request-buffer (subseq *buffer* 0 remain-size))
+                          (return))
+                        (setf buffer *buffer*)
+                        (setf buffer-size (+ read-size remain-size))
+                        (go :start)))
+                     (t
+                      ;; TODO この場合も上と同じように *buffer* を大きくする。
+                      (memmove buffer position buffer-size)
+                      (let ((read-size (receive fd buffer remain-size (length buffer))))
+                        (unless read-size
+                          (setf remain-request-buffer (subseq buffer 0 remain-size))
+                          (return))
+                        (setf buffer-size (+ read-size remain-size))
+                        (go :start))))))))))
 
 
 (defmethod receive-request (server fd)
-  (let* ((env (gethash fd *fd-hash*))
-         (start (let* ((buf (gethash :remain-request-buffer env #()))
-                       (len (length buf)))
-                  (iterate ((i (scan-range :length len)))
-                    (setf (aref *buffer* i) (aref buf i)))
-                  len))
-         (read-size (handler-case (receive fd *buffer* start (length *buffer*))
-                      (iolib.syscalls:econnreset ()
-                        -1))))
-    (if (plusp read-size)
-        (parse-request server fd *buffer* (+ start read-size) env)
-        (close-connection server fd))))
+  (let ((request (gethash fd *fd-hash*)))
+    (with-slots (remain-request-buffer) request
+      (let* ((start (let* ((buf remain-request-buffer)
+                           (len (length buf)))
+                      (iterate ((i (scan-range :length len)))
+                        (setf (aref *buffer* i) (aref buf i)))
+                      (setf remain-request-buffer nil)
+                      len))
+             (read-size (handler-case (receive fd *buffer* start (length *buffer*))
+                          (iolib.syscalls:econnreset () -1))))
+        (if (plusp read-size)
+            (parse-request server fd *buffer* (+ start read-size) request)
+            (close-connection server fd))))))
 
-(defvar *env*)
-
-(defun keep-alive-p (env)
-  ;; TODO Connection ヘッダ
-  (and
-   (equal (gethash "SERVER_PROTOCOL" env) "HTTP/1.1")
-   (plusp (slot-value *server* 'keep-alive-timeout))))
+(defun reset-client-fd-for-keep-alive (fd)
+  (reset-request *request*)
+  (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet))
 
 (defmethod send-response (server fd)
   (with-slots (document-root handler) server
-    (let ((*env* (gethash fd *fd-hash*)))
-      (handle-request handler server fd *env*)
-      (if (keep-alive-p *env*)
-          (progn
-            (remhash :parse-function *env*)
-            (remhash :remain-request-buffer *env*)
-            (iterate (((k v) (scan-hash *env*)))
-              (declare (ignore v))
-              (when (stringp k)
-                (remhash k *env*)))
-            (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet))
-          (close-connection server fd)))))
+    (let ((*request* (gethash fd *fd-hash*)))
+      (handle-request handler server fd *request*))))
 
 (defun status-message (status)
   (case status
@@ -281,12 +275,12 @@
     (t "que")))
 
 (defmethod write-response ((string string))
-  (let ((fd (gethash :fd *env*)))
+  (with-slots  (fd) *request*
     (cffi:with-foreign-string ((s length) string :encoding :utf-8 :null-terminated-p nil)
       (isys:write fd s length))))
 
 (defmethod write-response (vector)
-  (let ((fd (gethash :fd *env*)))
+  (with-slots  (fd) *request*
     (cffi-sys:with-pointer-to-vector-data (pointer vector)
       (isys:write fd pointer (length vector)))))
 
@@ -329,7 +323,7 @@ Last-modified: ~a~a~
     t))
 
 (defun %send-response (status headers body)
-  (let ((fd (gethash :fd *env*)))
+  (with-slots (fd) *request*
     (aif (cdr (assoc "X-Sendfile" headers :test #'equal))
          (unless (sendfile fd it)
            (error "X-Sendfile not found"))
@@ -345,47 +339,52 @@ Last-modified: ~a~a~
 
 
 (defmethod close-connection (server fd)
-  (let ((env (gethash fd *fd-hash*)))
-    (awhen (and env (gethash :keep-alive-timer env))
+  (let ((*request* (gethash fd *fd-hash*)))
+    (awhen (and *request* (slot-value *request* 'keep-alive-timer))
       (iomux::unschedule-timer *timers* it)))
   (remhash fd *fd-hash*)
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
   (isys:close fd))
 
-(defmethod response-404 (handler env)
-  (values ))
-
-
-(defclass sendfile-handler ()
+(defclass after-handle-request-mixin ()
   ())
 
-(defmethod handle-request or ((handler sendfile-handler) server fd env)
+(defmethod handle-request :around ((handler after-handle-request-mixin) server fd request)
+  (call-next-method)
+  (if (keep-alive-p request)
+      (reset-client-fd-for-keep-alive fd)
+      (close-connection server fd)))
+
+(defclass sendfile-handler (after-handle-request-mixin)
+  ())
+
+(defmethod handle-request or ((handler sendfile-handler) server fd request)
   (let* ((path (concatenate 'string
-                             (gethash "DOCUMENT_ROOT" env)
-                             (gethash "PATH_INFO" env))))
+                            (env request :document-root)
+                            (env request :path-info))))
     (when (and (fad:file-exists-p path)
                (not (fad:directory-exists-p path)))
       (sendfile fd path))))
 
-(defclass 404-handler ()
+(defclass 404-handler (after-handle-request-mixin)
   ())
 
-(defmethod handle-request or ((handler 404-handler) server fd env)
+(defmethod handle-request or ((handler 404-handler) server fd request)
   (let ((body (string-to-octets (concatenate 'string "<html>
 <head><title>not found</title></head>
-<body>Not Found. " (h (gethash "PATH_INFO" env)) "</body></html>"))))
+<body>Not Found. " (h (env request :path-info)) "</body></html>"))))
     (%send-response 404 `(("Content-type" . "text/html")
                           ("Date" . ,(rfc-2822-now))
                           ("Content-Length" . ,(length body)))
                     (list body))))
 
 
-(defclass cgi-handler ()
+(defclass cgi-handler (after-handle-request-mixin)
   ())
 
-(defmethod handle-request or ((handler cgi-handler) server fd env)
-  (let ((path (concatenate 'string (gethash "DOCUMENT_ROOT" env)
-                           (gethash "PATH_INFO" env))))
+(defmethod handle-request or ((handler cgi-handler) server fd request)
+  (let ((path (concatenate 'string (env request :document-root)
+                           (env request :path-info))))
     (when (alexandria:ends-with-subseq ".cgi" path :test #'equal)
       (let ((body (with-output-to-string (body)
                     (sb-ext:run-program
@@ -393,7 +392,7 @@ Last-modified: ~a~a~
                      :output body
                      :environment (collect 'bag
                                     (choose
-                                     (multiple-value-bind (k v) (scan-hash env)
+                                     (multiple-value-bind (k v) (scan-hash (slot-value request 'env))
                                        (when (stringp k)
                                          (format nil "~a=~a" k v)))))))))
         (write-response (format nil "HTTP/1.1 200 OK~a" +crlf+))

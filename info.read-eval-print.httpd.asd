@@ -3,6 +3,7 @@
   :components ((:file "package")
                (:file "util")
                (:file "parse")
+               (:file "request")
                (:file "response")
                (:file "app-handler")
                (:file "httpd"))
@@ -10,4 +11,5 @@
                :cl-fad
                :anaphora
                :trivial-gray-streams
+               :sb-concurrency
                :info.read-eval-print.series-ext))
