@@ -22,14 +22,16 @@
     (setf (cffi:mem-aref buf :int 0) client-fd)
     (isys:write accept-thread-fd buf #.(cffi:foreign-type-size :int))))
 
-(defun app-handler-loop (app mailbox)
-  (loop for request = (sb-concurrency:receive-message mailbox)
-        do (with-slots (accept-thread-fd fd response) request
-             (let ((*standard-output* response))
-               (call app request)
-               (force-output *standard-output*)
-               (reset-request request)
-               (return-client-fd fd accept-thread-fd)))))
+(defun app-handler-loop (app mailbox server)
+  (let ((*server* server))
+    (loop for request = (sb-concurrency:receive-message mailbox :timeout 500)
+          until (quit-p server)
+          do (with-slots (accept-thread-fd fd response) request
+               (let ((*standard-output* response))
+                 (call app request)
+                 (force-output *standard-output*)
+                 (reset-request request)
+                 (return-client-fd fd accept-thread-fd))))))
 
 
 (defmethod initialize-instance :after ((self app-handler) &key)
@@ -38,7 +40,7 @@
           (collect (sb-thread:make-thread
                     #'app-handler-loop
                     :name (format nil "app thread ~d" (scan-range :length number-of-threads))
-                    :arguments (list app mailbox))))))
+                    :arguments (list app mailbox *server*))))))
 
 (defclass env-dump-app ()
   ())

@@ -84,7 +84,18 @@
    (number-of-threads :initarg :number-of-threads :initform 1)
    (default-buffer-size :initarg :default-buffer-size :initform 10)
    (handler :initarg :handler :initform (make-instance 'default-handler))
-   (keep-alive-timeout :initarg :keep-alive-timer :initform 10)))
+   (keep-alive-timeout :initarg :keep-alive-timer :initform 10)
+   (quit :initform nil :accessor quit-p)
+   (accept-threads :initform nil)))
+
+(defmethod (setf quit-p) :after (value (server server))
+  (when value
+    (print 'closing)
+    (close (slot-value server 'listen-socket))
+    (print 'closed)
+    (dolist (thread (slot-value server 'accept-threads))
+      (print thread)
+      (sb-thread:terminate-thread thread))))
 
 (defvar *server*)
 (defvar *fd-hash*)
@@ -151,6 +162,7 @@
                               (isys:eintr ()
                                 (warn "epoll-wait EINTR")
                                 0))
+            until (quit-p server)
             do (handle-events events ready-fds pipe-read-fd)))))
 
 (defun start-accept-thread (server)
@@ -169,12 +181,13 @@
         (loop with listen-fd = (slot-value server 'listen-fd)
               for client-fd = (iolib.sockets::with-sockaddr-storage-and-socklen (ss size)
                                 (iolib.sockets::%accept listen-fd ss size))
+              until (quit-p server)
               do (setf (isys:fd-nonblock client-fd) t)
                  (setf (cffi:mem-aref buf :int 0) client-fd)
                  (sb-posix:write pipe-write-fd buf #.(cffi:foreign-type-size :int)))))))
 
 (defmethod start (server)
-  (with-slots (port bind-address listen-socket listen-fd number-of-threads) server
+  (with-slots (port bind-address listen-socket listen-fd number-of-threads accept-threads) server
     (iolib.sockets:with-open-socket (%listen-socket :address-family :ipv4
                                                     :type :stream
                                                     :connect :passive
@@ -185,13 +198,13 @@
       (setf listen-socket %listen-socket)
       (setf listen-fd (iolib.streams:fd-of listen-socket))
       (setf (isys:fd-nonblock listen-fd) nil)
-      (let ((threads (collect 'bag
-                       (let ((thread-name (format nil "accepter ~d"
-                                                  (1+ (scan-range :length number-of-threads)))))
-                         (sb-thread:make-thread #'start-accept-thread
-                                                :name thread-name
-                                                :arguments (list server))))))
-        (collect-ignore (sb-thread:join-thread (scan 'list threads)))))))
+      (setf accept-threads (collect 'bag
+                             (let ((thread-name (format nil "accepter ~d"
+                                                        (1+ (scan-range :length number-of-threads)))))
+                               (sb-thread:make-thread #'start-accept-thread
+                                                      :name thread-name
+                                                      :arguments (list server)))))
+      (ignore-errors (collect-ignore (sb-thread:join-thread (scan accept-threads)))))))
 
 
 (defmethod normalize-request (server request buffer position fd)

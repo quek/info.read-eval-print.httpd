@@ -4,5 +4,11 @@
  :info.read-eval-print.httpd
  (:use :cl :anaphora)
  (:export #:start
-          #:server))
+          #:server
+          #:quit-p
 
+          #:default-handler
+          #:cgi-handler
+          #:sendfile-handler
+          #:404-handler
+          #:app-handler))
