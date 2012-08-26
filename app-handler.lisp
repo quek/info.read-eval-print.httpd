@@ -9,11 +9,10 @@
    (threads :initform nil)
    (mailbox :initform (sb-concurrency:make-mailbox))))
 
-(defmethod handle-request or ((handler app-handler) server fd request)
+(defmethod handle-request or ((handler app-handler) server request)
   (with-slots (mailbox) handler
     (with-slots (accept-thread-fd response) request
       (setf accept-thread-fd *accept-thread-fd*)
-      (setf response (make-instance 'response-stream :fd fd))
       (sb-concurrency:send-message mailbox request)
       t)))
 
@@ -24,8 +23,8 @@
 
 (defun app-handler-loop (app mailbox)
   (loop for request = (sb-concurrency:receive-message mailbox :timeout 500)
-        do (with-slots (accept-thread-fd fd response) request
-             (let ((*standard-output* response))
+        do (with-slots (accept-thread-fd fd) request
+             (let ((*standard-output* (make-response-stream request)))
                (call app request)
                (force-output *standard-output*)
                (reset-request request)

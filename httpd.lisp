@@ -67,7 +67,7 @@
 (defgeneric start (server))
 (defgeneric stop (server))
 
-(defgeneric handle-request (handler server fd request)
+(defgeneric handle-request (handler server request)
   (:method-combination or))
 
 (defgeneric accept (server))
@@ -267,7 +267,7 @@
 (defmethod send-response (server fd)
   (with-slots (document-root handler) server
     (let ((*request* (gethash fd *fd-hash*)))
-      (handle-request handler server fd *request*))))
+      (handle-request handler server *request*))))
 
 (defun status-message (status)
   (case status
@@ -350,40 +350,43 @@ Last-modified: ~a~a~
 (defclass after-handle-request-mixin ()
   ())
 
-(defmethod handle-request :around ((handler after-handle-request-mixin) server fd request)
+(defmethod handle-request :around ((handler after-handle-request-mixin) server request)
   (call-next-method)
-  (if (keep-alive-p request)
-      (reset-client-fd-for-keep-alive fd)
-      (close-connection server fd)))
+  (with-slots (fd) request
+    (if (keep-alive-p request)
+        (reset-client-fd-for-keep-alive fd)
+        (close-connection server fd))))
 
 (defclass sendfile-handler (after-handle-request-mixin)
   ())
 
-(defmethod handle-request or ((handler sendfile-handler) server fd request)
-  (let* ((path (concatenate 'string
-                            (env request :document-root)
-                            (env request :path-info))))
-    (when (and (fad:file-exists-p path)
-               (not (fad:directory-exists-p path)))
-      (sendfile fd path))))
+(defmethod handle-request or ((handler sendfile-handler) server request)
+  (with-slots (fd) request
+    (let* ((path (concatenate 'string
+                              (env request :document-root)
+                              (env request :path-info))))
+      (when (and (fad:file-exists-p path)
+                 (not (fad:directory-exists-p path)))
+        (sendfile fd path)))))
+
 
 (defclass 404-handler (after-handle-request-mixin)
   ())
 
-(defmethod handle-request or ((handler 404-handler) server fd request)
-  (let ((body (string-to-octets (concatenate 'string "<html>
+(defmethod handle-request or ((handler 404-handler) server request)
+  (let ((response (make-response-stream request)))
+    (setf (response-status-of response) 404)
+    (format response  "<html>
 <head><title>not found</title></head>
-<body>Not Found. " (h (env request :path-info)) "</body></html>"))))
-    (%send-response 404 `(("Content-type" . "text/html")
-                          ("Date" . ,(rfc-2822-now))
-                          ("Content-Length" . ,(length body)))
-                    (list body))))
+<body>Not Found. ~a</body></html>" (h (env request :path-info)) )
+    (force-output response)
+    t))
 
 
 (defclass cgi-handler (after-handle-request-mixin)
   ())
 
-(defmethod handle-request or ((handler cgi-handler) server fd request)
+(defmethod handle-request or ((handler cgi-handler) server request)
   (let ((path (concatenate 'string (env request :document-root)
                            (env request :path-info))))
     (when (alexandria:ends-with-subseq ".cgi" path :test #'equal)

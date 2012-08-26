@@ -1,6 +1,7 @@
 (in-package :info.read-eval-print.httpd)
 
 (defgeneric keep-alive-p (request))
+(defgeneric make-response-stream (request))
 
 (defclass request ()
   ((env :initform (make-hash-table :test #'equal) :accessor env-of)
@@ -8,8 +9,7 @@
    (keep-alive-timer :initform nil)
    (parse-function :initform nil)
    (remain-request-buffer :initform nil)
-   (accept-thread-fd)
-   (response)))
+   (accept-thread-fd)))
 
 (defclass http-0.9-request (request)
   ())
@@ -20,6 +20,9 @@
 (defclass http-1.1-request (request)
   ())
 
+
+(defmethod make-response-stream (request)
+  (make-instance 'response-stream :fd (slot-value request 'fd)))
 
 (defmethod env ((request request) key &optional default-value)
   (with-slots (env) request
