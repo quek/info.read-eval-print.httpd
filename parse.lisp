@@ -39,10 +39,20 @@
          (values t (1+ it) #'parse-protocol))
        (values nil start #'parse-request-uri)))
 
+(defun request-class-from-protocol (protocol)
+  (cond ((equal protocol "HTTP/1.1")
+         'http-1.1-request)
+        ((equal protocol "HTTP/1.0")
+         'http-1.0-request)
+        ((equal protocol "HTTP/0.9")
+         'http-0.9-request)
+        (t (error 'invalid-request))))
+
 (defun parse-protocol (buffer start end request)
   (aif (position #x0d buffer :start start :end end)
-       (progn
-         (setf (env request :server-protocol) (octets-to-string buffer :start start :end it))
+       (let ((protocol (octets-to-string buffer :start start :end it)))
+         (setf (env request :server-protocol) protocol)
+         (change-class request (request-class-from-protocol protocol))
          (values t (1+ it) #'parse-header))
        (values nil start #'parse-protocol)))
 
