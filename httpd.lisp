@@ -90,11 +90,8 @@
 
 (defmethod (setf quit-p) :after (value (server server))
   (when value
-    (print 'closing)
     (close (slot-value server 'listen-socket))
-    (print 'closed)
     (dolist (thread (slot-value server 'accept-threads))
-      (print thread)
       (sb-thread:terminate-thread thread))))
 
 (defvar *server*)
