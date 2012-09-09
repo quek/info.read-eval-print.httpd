@@ -6,6 +6,7 @@
                (:file "request")
                (:file "response")
                (:file "app-handler")
+               (:file "cgi-handler")
                (:file "httpd"))
   :depends-on (:iolib
                :cl-fad

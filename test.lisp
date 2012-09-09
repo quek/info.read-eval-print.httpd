@@ -81,4 +81,8 @@
   (hu.dwim.stefil:is (string= (path-content "/index.html")
                               (drakma:http-request (url "/index.html")))))
 
+(hu.dwim.stefil:deftest test-cgi-hello ()
+  (hu.dwim.stefil:is (ppcre:scan "<h1>Hello, World!</h1>"
+                                 (drakma:http-request (url "/cgi-bin/hello.cgi")))))
+
 (info.read-eval-print.httpd.test)

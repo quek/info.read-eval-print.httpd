@@ -98,20 +98,28 @@ app
     (404 "Not Found")
     (t "que")))
 
-(defmethod start-response ((stream response-stream))
+(defmethod start-response-line ((stream response-stream))
   (let ((fd (fd-of stream))
         (external-format (external-format-of stream)))
-    (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 1)
-    (%format-to-fd fd
-                   external-format
+    (%format-to-fd fd external-format
                    "HTTP/1.1 ~d ~a~a"
                    (response-status-of stream)
                    (response-message-of stream)
-                   +crlf+)
+                   +crlf+)))
+
+(defmethod start-response-header ((stream response-stream))
+  (let ((fd (fd-of stream))
+        (external-format (external-format-of stream)))
     (iterate (((k v) (scan-alist (response-headers-of stream))))
       (%format-to-fd fd external-format
                      "~a: ~a~a" k v +crlf+))
-    (%format-to-fd fd external-format +crlf+)
+    (%format-to-fd fd external-format +crlf+)))
+
+(defmethod start-response ((stream response-stream))
+  (let ((fd (fd-of stream)))
+    (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 1)
+    (start-response-line stream)
+    (start-response-header stream)
     (setf (started-p stream) t)))
 
 

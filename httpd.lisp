@@ -101,6 +101,9 @@
 (defvar *buffer*)
 (defvar *accept-thread-fd*)
 (defvar *request*)
+(defvar *dispatch-in-table*)
+(defvar *dispatch-out-table*)
+(defvar *dispatch-hup-table*)
 
 (defun set-keep-alive-timer (fd request)
   (with-slots (keep-alive-timer) request
@@ -126,11 +129,14 @@
 (defun dispatch-epoll-event (fd event)
   (let ((event-mask (cffi:foreign-slot-value event 'isys:epoll-event 'isys:events)))
     (cond ((logtest event-mask isys:epollin)
-           (receive-request *server* fd))
+           (funcall (gethash fd *dispatch-in-table* 'receive-request)
+                    *server* fd))
           ((logtest event-mask isys:epollout)
-           (send-response *server* fd))
+           (funcall (gethash fd *dispatch-out-table* 'send-response)
+                    *server* fd))
           ((logtest event-mask isys:epollhup)
-           (close-connection *server* fd)))))
+           (funcall (gethash fd *dispatch-hup-table* 'close-connection)
+                    *server* fd)))))
 
 ;; (declaim (inline handle-events))
 (defun handle-events (events ready-fds pipe-read-fd)
@@ -145,35 +151,46 @@
           do (dispatch-epoll-event event-fd event))
   (iomux::expire-pending-timers *timers* (isys:get-monotonic-time)))
 
-(defun start-handler-thread (server fd-hash timers epoll-fd pipe-read-fd pipe-write-fd)
+;; TODO defstruct thread-data とかして引数をまとてめる。
+(defun start-handler-thread (server fd-hash timers epoll-fd pipe-read-fd pipe-write-fd
+                             dispatch-in-table dispatch-out-table dispatch-hup-table)
   (let ((*server* server)
         (*fd-hash* fd-hash)
         (*timers* timers)
         (*epoll-fd* epoll-fd)
         (*buffer* (make-array (slot-value server 'default-buffer-size) :element-type '(unsigned-byte 8)))
-        (*accept-thread-fd* pipe-write-fd))
+        (*accept-thread-fd* pipe-write-fd)
+        (*dispatch-in-table* dispatch-in-table)
+        (*dispatch-out-table* dispatch-out-table)
+        (*dispatch-hup-table* dispatch-hup-table))
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
-      (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
-      (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+
-                                                           500)
-                              (isys:eintr ()
-                                (warn "epoll-wait EINTR")
-                                0))
-            until (quit-p server)
-            do (handle-events events ready-fds pipe-read-fd)))))
+          (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
+          (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+
+                                                    500)
+                                  (isys:eintr ()
+                                    (warn "epoll-wait EINTR")
+                                    0))
+                until (quit-p server)
+                do (handle-events events ready-fds pipe-read-fd)))))
 
 (defun start-accept-thread (server)
   (let ((*server* server)
         (*fd-hash* (make-hash-table))
         (*timers* (iomux::make-priority-queue :key #'iomux::%timer-expire-time))
-        (*epoll-fd* (isys:epoll-create 1)))
+        (*epoll-fd* (isys:epoll-create 1))
+        (*dispatch-in-table* (make-hash-table))
+        (*dispatch-out-table* (make-hash-table))
+        (*dispatch-hup-table* (make-hash-table)))
     (multiple-value-bind (pipe-read-fd pipe-write-fd) (sb-posix:pipe)
       (epoll-ctl pipe-read-fd *epoll-fd* isys:epoll-ctl-add isys:epollin)
       (sb-thread:make-thread #'start-handler-thread
                              :name (format nil "handler of ~a"
                                            (sb-thread:thread-name sb-thread:*current-thread*))
                              :arguments (list *server* *fd-hash* *timers* *epoll-fd*
-                                              pipe-read-fd pipe-write-fd))
+                                              pipe-read-fd pipe-write-fd
+                                              *dispatch-in-table*
+                                              *dispatch-out-table*
+                                              *dispatch-hup-table*))
       (cffi:with-foreign-object (buf :int)
         (loop with listen-fd = (slot-value server 'listen-fd)
               for client-fd = (iolib.sockets::with-sockaddr-storage-and-socklen (ss size)
@@ -382,26 +399,6 @@ Last-modified: ~a~a~
     (force-output response)
     t))
 
-
-(defclass cgi-handler (after-handle-request-mixin)
-  ())
-
-(defmethod handle-request or ((handler cgi-handler) server request)
-  (let ((path (concatenate 'string (env request :document-root)
-                           (env request :path-info))))
-    (when (alexandria:ends-with-subseq ".cgi" path :test #'equal)
-      (let ((body (with-output-to-string (body)
-                    (sb-ext:run-program
-                     "/bin/sh" (list path)
-                     :output body
-                     :environment (collect 'bag
-                                    (choose
-                                     (multiple-value-bind (k v) (scan-hash (slot-value request 'env))
-                                       (when (stringp k)
-                                         (format nil "~a=~a" k v)))))))))
-        (write-response (format nil "HTTP/1.1 200 OK~a" +crlf+))
-        (write-response body)
-        t))))
 
 (defclass default-handler (cgi-handler sendfile-handler 404-handler)
   ())

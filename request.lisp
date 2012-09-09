@@ -5,7 +5,7 @@
 
 (defclass request ()
   ((env :initform (make-hash-table :test #'equal) :accessor env-of)
-   (fd :initarg :fd)
+   (fd :initarg :fd :accessor fd-of)
    (keep-alive-timer :initform nil)
    (parse-function :initform nil)
    (remain-request-buffer :initform nil)
