@@ -89,14 +89,16 @@
    (quit :initform nil :accessor quit-p)
    (accept-threads :initform nil)))
 
-(defmethod initialize-instance :after ((server server) &key applications)
-  (when applications
-    (cond ((atom applications)
-           (install-application server applications))
-          ((atom (car applications))
-           (apply #'install-application applications))
-          (t
-           (mapcan #'install-application applications)))))
+(defmethod initialize-instance :after ((server server) &key application applications)
+  (when application
+    (if (atom application)
+        (install-application server application)
+        (apply #'install-application server application)))
+  (mapcan (lambda (x)
+            (if (atom x)
+                (install-application server x)
+                (apply #'install-application server x)))
+          applications))
 
 (defmethod (setf quit-p) :after (value (server server))
   (when value

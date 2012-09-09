@@ -13,7 +13,8 @@
   (with-slots (mailbox apps) handler
     (awhen (assoc (env request :path-info) apps
                   :test (lambda (a b)
-                          (alexandria:starts-with-subseq b a)))
+                          (ppcre:scan (format nil "^~a([/?].*|$)" (ppcre:quote-meta-chars b))
+                                      a)))
       (with-slots (accept-thread-fd response) request
         (setf (env request :script-name) (car it)
               (env request :path-info) (subseq (env request :path-info) (length (car it)))
@@ -73,5 +74,5 @@
  (lambda ()
    (info.read-eval-print.httpd:start
     (make-instance 'info.read-eval-print.httpd:server
-                   :applications 'env-dump-app))))
+                   :application '(env-dump-app :context-root "/env")))))
 |#
