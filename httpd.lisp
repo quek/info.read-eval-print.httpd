@@ -66,6 +66,7 @@
 
 (defgeneric start (server))
 (defgeneric stop (server))
+(defgeneric install-application (server application &key context-root))
 
 (defgeneric handle-request (handler server request)
   (:method-combination or))
@@ -88,6 +89,15 @@
    (quit :initform nil :accessor quit-p)
    (accept-threads :initform nil)))
 
+(defmethod initialize-instance :after ((server server) &key applications)
+  (when applications
+    (cond ((atom applications)
+           (install-application server applications))
+          ((atom (car applications))
+           (apply #'install-application applications))
+          (t
+           (mapcan #'install-application applications)))))
+
 (defmethod (setf quit-p) :after (value (server server))
   (when value
     (close (slot-value server 'listen-socket))
@@ -104,6 +114,7 @@
 (defvar *dispatch-in-table*)
 (defvar *dispatch-out-table*)
 (defvar *dispatch-hup-table*)
+(defvar *detach-p* nil)
 
 (defun set-keep-alive-timer (fd request)
   (with-slots (keep-alive-timer) request
@@ -220,6 +231,9 @@
                                                       :arguments (list server)))))
       (ignore-errors (collect-ignore (sb-thread:join-thread (scan accept-threads)))))))
 
+(defmethod install-application ((server server) application &key (context-root ""))
+  (with-slots (handler) server
+    (install-application handler application :context-root context-root)))
 
 (defmethod normalize-request (server request buffer position fd)
   (with-slots (document-root) server
@@ -283,8 +297,13 @@
 
 (defmethod send-response (server fd)
   (with-slots (document-root handler) server
-    (let ((*request* (gethash fd *fd-hash*)))
-      (handle-request handler server *request*))))
+    (let ((*request* (gethash fd *fd-hash*))
+          (*detach-p* nil))
+      (handle-request handler server *request*)
+      (unless *detach-p*
+        (if (keep-alive-p *request*)
+            (reset-client-fd-for-keep-alive fd)
+            (close-connection server fd))))))
 
 (defun status-message (status)
   (case status
@@ -364,17 +383,7 @@ Last-modified: ~a~a~
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
   (isys:close fd))
 
-(defclass after-handle-request-mixin ()
-  ())
-
-(defmethod handle-request :around ((handler after-handle-request-mixin) server request)
-  (call-next-method)
-  (with-slots (fd) request
-    (if (keep-alive-p request)
-        (reset-client-fd-for-keep-alive fd)
-        (close-connection server fd))))
-
-(defclass sendfile-handler (after-handle-request-mixin)
+(defclass sendfile-handler ()
   ())
 
 (defmethod handle-request or ((handler sendfile-handler) server request)
@@ -387,7 +396,7 @@ Last-modified: ~a~a~
         (sendfile fd path)))))
 
 
-(defclass 404-handler (after-handle-request-mixin)
+(defclass 404-handler ()
   ())
 
 (defmethod handle-request or ((handler 404-handler) server request)
@@ -400,7 +409,7 @@ Last-modified: ~a~a~
     t))
 
 
-(defclass default-handler (cgi-handler sendfile-handler 404-handler)
+(defclass default-handler (app-handler sendfile-handler 404-handler)
   ())
 
 #|

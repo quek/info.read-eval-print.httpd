@@ -4,40 +4,55 @@
 (defgeneric app-handler-thread-fds (app-handler))
 
 (defclass app-handler ()
-  ((app :initarg :app :initform (make-instance 'env-dump-app))
+  ((apps :initarg :apps :initform ())
    (number-of-threads :initarg :number-of-threads :initform 2)
    (threads :initform nil)
    (mailbox :initform (sb-concurrency:make-mailbox))))
 
 (defmethod handle-request or ((handler app-handler) server request)
-  (with-slots (mailbox) handler
-    (with-slots (accept-thread-fd response) request
-      (setf accept-thread-fd *accept-thread-fd*)
-      (sb-concurrency:send-message mailbox request)
-      t)))
+  (with-slots (mailbox apps) handler
+    (awhen (assoc (env request :path-info) apps
+                  :test (lambda (a b)
+                          (alexandria:starts-with-subseq b a)))
+      (with-slots (accept-thread-fd response) request
+        (setf (env request :script-name) (car it)
+              (env request :path-info) (subseq (env request :path-info) (length (car it)))
+              (env request :application) (cdr it)
+              accept-thread-fd *accept-thread-fd*)
+        (describe request)
+        (sb-concurrency:send-message mailbox request)
+        (setf *detach-p* t)
+        t))))
+
+(defmethod install-application ((handler app-handler) (application symbol) &key context-root)
+  (install-application handler (make-instance application) :context-root context-root))
+
+(defmethod install-application ((handler app-handler) application &key context-root)
+  (with-slots (apps) handler
+    (setf apps (acons context-root application apps))))
 
 (defun return-client-fd (client-fd accept-thread-fd)
   (cffi:with-foreign-object (buf :int)
     (setf (cffi:mem-aref buf :int 0) client-fd)
     (isys:write accept-thread-fd buf #.(cffi:foreign-type-size :int))))
 
-(defun app-handler-loop (app mailbox)
-  (loop for request = (sb-concurrency:receive-message mailbox :timeout 500)
+(defun app-handler-loop (mailbox)
+  (loop for request = (sb-concurrency:receive-message mailbox)
+        do (describe request)
         do (with-slots (accept-thread-fd fd) request
              (let ((*standard-output* (make-response-stream request)))
-               (call app request)
+               (call (env request :application) request)
                (force-output *standard-output*)
                (reset-request request)
                (return-client-fd fd accept-thread-fd)))))
 
-
 (defmethod initialize-instance :after ((self app-handler) &key)
-  (with-slots (app number-of-threads mailbox threads) self
+  (with-slots (number-of-threads mailbox threads) self
     (setf threads
           (collect (sb-thread:make-thread
                     #'app-handler-loop
                     :name (format nil "app thread ~d" (scan-range :length number-of-threads))
-                    :arguments (list app mailbox))))))
+                    :arguments (list mailbox))))))
 
 (defclass env-dump-app ()
   ())
@@ -56,6 +71,7 @@
 #|
 (sb-thread:make-thread
  (lambda ()
-   (info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server
-                                                    :handler (make-instance 'app-handler)))))
+   (info.read-eval-print.httpd:start
+    (make-instance 'info.read-eval-print.httpd:server
+                   :applications 'env-dump-app))))
 |#
