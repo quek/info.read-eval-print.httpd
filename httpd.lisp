@@ -349,7 +349,8 @@
          (content-length (isys:stat-size st)))
     (with-cork (fd)
       (cffi:with-foreign-string ((s length)
-                                 (format nil "HTTP/1.1 200 OK~a~
+                                 (format nil "~
+HTTP/1.1 200 OK~a~
 Content-Type: ~a~a~
 Content-Length: ~d~a~
 Date: ~a~a~
@@ -363,7 +364,13 @@ Last-modified: ~a~a~
                                          +crlf+)
                                  :null-terminated-p nil)
         (isys:write fd s length))
-      (%sendfile fd file-fd (cffi-sys:null-pointer) content-length))
+      (cffi:with-foreign-object (offset :long)
+        (setf (cffi:mem-ref offset :long) 0)
+        (loop for done = (handler-case (%sendfile fd file-fd offset content-length)
+                           (iolib.syscalls:ewouldblock ()
+                             ;; TODO event 的にする
+                             0))
+              until (zerop (decf content-length done)))))
     (isys:close file-fd)
     t))
 
