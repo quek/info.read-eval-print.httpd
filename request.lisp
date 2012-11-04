@@ -10,6 +10,7 @@
    (parse-function :initform nil)
    (remain-request-buffer :initform nil)
    (accept-thread-fd)
+   (post-data :initform nil)
    (params)))
 
 (defmethod reset-request ((request request))
@@ -48,3 +49,30 @@
   (with-slots (env) request
     (and
      (plusp (slot-value *server* 'keep-alive-timeout)))))
+
+
+(defun params (request name)
+  (with-slots (params) request
+    (unless (slot-boundp request 'params)
+      (setf params
+            (append
+             (let ((query-string (env request :query-string)))
+               (when (and query-string (plusp (length query-string)))
+                 (collect 'bag (let ((k-v (ppcre:split "=" (scan-split "&" query-string))))
+                                 (cons (percent:decode (car k-v))
+                                       (percent:decode (cadr k-v)))))))
+             (let ((post-data (slot-value request 'post-data))
+                   (params nil))
+               (when (and post-data (plusp (length post-data)))
+                 (labels ((f (seq)
+                            (let ((p= (position #\= seq)))
+                              (cons (percent:decode (octets-to-string seq :end p=))
+                                    (percent:decode (octets-to-string seq :start (1+ p=)))))))
+                   (loop for start = 0 then (1+ p&)
+                         for p& = (position #\& post-data :start start)
+                         do (if p&
+                                (push (f (subseq post-data start p&)) params)
+                                (progn
+                                  (push (f (subseq post-data start)) params)
+                                  (return (nreverse params)))))))))))
+    (cdr (assoc name params :test #'string-equal))))

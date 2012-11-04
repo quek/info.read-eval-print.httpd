@@ -86,6 +86,23 @@
   (hu.dwim.stefil:is (ppcre:scan "<h1>Hello, World!</h1>"
                                  (drakma:http-request (url "/cgi-bin/hello.cgi")))))
 
+(hu.dwim.stefil:deftest test-post ()
+  (multiple-value-bind (content code)
+      (drakma:http-request (format nil "http://~a:~a/index.html" *test-host* *test-port*)
+                        :method :post
+                        :parameters ' (("ab" . "cd")
+                                       ("ef" . "gh")))
+    (declare (ignore content))
+    (hu.dwim.stefil:is (= 200 code)))
+    (multiple-value-bind (content code)
+      (drakma:http-request (format nil "http://~a:~a/index.html" *test-host* *test-port*)
+                           :method :post
+                           :content-length 11 
+                           :parameters ' (("ab" . "cd")
+                                          ("ef" . "gh")))
+      (declare (ignore content))
+      (hu.dwim.stefil:is (= 200 code))))
+
 (info.read-eval-print.httpd.test)
 
 #|

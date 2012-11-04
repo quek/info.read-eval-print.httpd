@@ -69,16 +69,6 @@
   (print (h (princ-to-string request)))
   (write-string "</body></html>"))
 
-(defun params (request name)
-  (with-slots (params) request
-    (unless (slot-boundp request 'params)
-      (setf params
-            (let ((query-string (env request :query-string)))
-              (when (and query-string (plusp (length query-string)))
-               (collect 'bag (let ((k-v (ppcre:split "=" (scan-split "&" query-string))))
-                               (cons (percent:decode (car k-v))
-                                     (percent:decode (cadr k-v)))))))))
-    (cdr (assoc name params :test #'string-equal))))
 
 #|
 (sb-thread:make-thread
