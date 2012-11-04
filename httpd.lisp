@@ -304,14 +304,15 @@
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet))
 
 (defmethod send-response (server fd)
-  (with-slots (document-root handler) server
-    (let ((*request* (gethash fd *fd-hash*))
-          (*detach-p* nil))
-      (handle-request handler server *request*)
-      (unless *detach-p*
-        (if (keep-alive-p *request*)
-            (reset-client-fd-for-keep-alive fd)
-            (close-connection server fd))))))
+  (catch 'send-response
+    (with-slots (document-root handler) server
+      (let ((*request* (gethash fd *fd-hash*))
+            (*detach-p* nil))
+        (handle-request handler server *request*)
+        (unless *detach-p*
+          (if (keep-alive-p *request*)
+              (reset-client-fd-for-keep-alive fd)
+              (close-connection server fd)))))))
 
 (defun status-message (status)
   (case status
@@ -364,15 +365,28 @@ Last-modified: ~a~a~
                                          +crlf+)
                                  :null-terminated-p nil)
         (isys:write fd s length))
-      (cffi:with-foreign-object (offset :long)
-        (setf (cffi:mem-ref offset :long) 0)
-        (loop for done = (handler-case (%sendfile fd file-fd offset content-length)
-                           (iolib.syscalls:ewouldblock ()
-                             ;; TODO event 的にする
-                             0))
-              until (zerop (decf content-length done)))))
-    (isys:close file-fd)
+      (let ((offset (cffi:foreign-alloc :long :initial-element 0)))
+        (sendfile-loop fd file-fd offset content-length)))
     t))
+
+(defun sendfile-loop (dist-fd src-fd offset length)
+  (loop for done = (handler-case (%sendfile dist-fd src-fd offset length)
+                     (iolib.syscalls:ewouldblock ()
+                       (setf (gethash dist-fd *dispatch-out-table*)
+                             (lambda (server dist-fd)
+                               (let ((*request* (gethash dist-fd *fd-hash*)))
+                                 (sendfile-loop dist-fd src-fd offset length)
+                                 (remhash dist-fd *dispatch-out-table*)
+                                 (if (keep-alive-p *request*)
+                                     (reset-client-fd-for-keep-alive dist-fd)
+                                     (close-connection server dist-fd)))))
+                       (throw 'send-response nil))
+                     (error ()
+                       (loop-finish)))
+        until (zerop (decf length done)))
+  (cffi-sys:foreign-free offset)
+  (isys:close src-fd)
+  t)
 
 (defun %send-response (status headers body)
   (with-slots (fd) *request*
