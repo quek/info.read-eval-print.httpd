@@ -90,6 +90,12 @@
    (accept-threads :initform nil)))
 
 (defmethod initialize-instance :after ((server server) &key application applications)
+  (with-slots (document-root) server
+    (setf document-root
+          (string-right-trim '(#\/)
+                             (if (pathnamep document-root)
+                                 (directory-namestring document-root)
+                                 document-root))))
   (when application
     (if (atom application)
         (install-application server application)
@@ -411,7 +417,7 @@ Last-modified: ~a~a~
     t))
 
 
-(defclass default-handler (app-handler sendfile-handler 404-handler)
+(defclass default-handler (sendfile-handler app-handler 404-handler)
   ())
 
 #|

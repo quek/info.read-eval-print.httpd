@@ -9,7 +9,15 @@
    (keep-alive-timer :initform nil)
    (parse-function :initform nil)
    (remain-request-buffer :initform nil)
-   (accept-thread-fd)))
+   (accept-thread-fd)
+   (params)))
+
+(defmethod reset-request ((request request))
+  (with-slots (env parse-function remain-request-buffer) request
+    (clrhash env)
+    (setf parse-function nil)
+    (setf remain-request-buffer nil)
+    (slot-makunbound request 'params)))
 
 (defclass http-0.9-request (request)
   ())
@@ -40,9 +48,3 @@
   (with-slots (env) request
     (and
      (plusp (slot-value *server* 'keep-alive-timeout)))))
-
-(defmethod reset-request ((request request))
-  (with-slots (env parse-function remain-request-buffer) request
-    (clrhash env)
-    (setf parse-function nil)
-    (setf remain-request-buffer nil)))

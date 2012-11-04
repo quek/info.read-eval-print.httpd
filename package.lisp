@@ -11,4 +11,8 @@
           #:cgi-handler
           #:sendfile-handler
           #:404-handler
-          #:app-handler))
+          #:app-handler
+
+          #:call
+          #:env
+          #:params))

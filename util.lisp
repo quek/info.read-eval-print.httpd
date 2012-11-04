@@ -62,7 +62,9 @@
      ("jpg" . "image/jpeg")
      ("pdf" . "application/pdf")
      ("ps" . "application/postscript")
-     ("zip" . "application/zip"))
+     ("zip" . "application/zip")
+     ("css" . "text/css")
+     ("js" . "application/x-javascript"))
    :test #'equalp))
 
 (defun mime-type (type)

@@ -13,4 +13,5 @@
                :anaphora
                :trivial-gray-streams
                :sb-concurrency
+               :percent-encoding
                :info.read-eval-print.series-ext))

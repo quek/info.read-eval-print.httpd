@@ -88,7 +88,9 @@
 
 (info.read-eval-print.httpd.test)
 
+#|
 (make-instance 'info.read-eval-print.httpd:server
                :application '("/my-app" my-app))
 
 (install-application server my-app :context-root "/my-app")
+|#
