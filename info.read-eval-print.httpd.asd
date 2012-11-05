@@ -11,6 +11,7 @@
   :depends-on (:iolib
                :cl-fad
                :anaphora
+               :cl-base64
                :trivial-gray-streams
                :sb-concurrency
                :percent-encoding

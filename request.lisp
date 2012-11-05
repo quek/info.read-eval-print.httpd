@@ -50,6 +50,14 @@
     (and
      (plusp (slot-value *server* 'keep-alive-timeout)))))
 
+(defmethod authorization ((request request))
+  (let ((authorization (env request :http-authorization)))
+    (ppcre:register-groups-bind (data) ("Basic \(.*\)" authorization)
+      (let ((user-password (base64:base64-string-to-string data)))
+        (awhen (position #\: user-password)
+          (values (subseq user-password 0 it)
+                  (subseq user-password (1+ it))))))))
+
 
 (defun params (request name)
   (with-slots (params) request

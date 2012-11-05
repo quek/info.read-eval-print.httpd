@@ -13,6 +13,9 @@
           #:404-handler
           #:app-handler
 
+          #:authorization
+          #:unauthorized
+
           #:call
           #:env
           #:params))
