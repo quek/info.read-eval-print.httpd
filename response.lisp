@@ -169,8 +169,17 @@ app
                              :null-terminated-p nil)
     (isys:write fd s length)))
 
+(defmethod add-header ((stream response-stream) key value)
+  (push (cons key value) (response-headers-of stream)))
 
 (defmethod unauthorized ((stream response-stream) &optional (realm "Common Lisp"))
   (setf (response-status-of stream) 401)
-  (push (cons "WWW-Authenticate" (format nil "Basic realm=\"~a\"" realm))
-        (response-headers-of stream)))
+  (add-header stream "WWW-Authenticate" (format nil "Basic realm=\"~a\"" realm)))
+
+(defmethod redirect ((stream response-stream) url)
+  (setf (response-status-of stream) 302)
+  (add-header stream "Location" url))
+
+(defmethod redirect-permanently ((stream response-stream) url)
+  (setf (response-status-of stream) 301)
+  (add-header stream "Location" url))

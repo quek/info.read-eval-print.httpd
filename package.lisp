@@ -15,7 +15,10 @@
 
           #:authorization
           #:unauthorized
+          #:redirect
+          #:redirect-premanently
 
           #:call
           #:env
-          #:params))
+          #:params
+          #:with-params))

@@ -10,7 +10,8 @@
                                   :null-terminate null-terminate))
 
 (defun octets-to-string (vector &key (external-format :utf-8) (start 0) end)
-  (sb-ext:octets-to-string vector :external-format external-format :start start :end end))
+  (sb-ext:octets-to-string (coerce vector '(vector (unsigned-byte 8) *))
+                           :external-format external-format :start start :end end))
 
 (defun memmove (buffer start end)
   (cffi-sys:with-pointer-to-vector-data (pointer buffer)

@@ -141,7 +141,7 @@
 (defun pares-length-post-data (buffer start end request)
   (with-slots (post-data) request
     (let ((length (parse-integer (env request :http-content-length))))
-      (setf post-data (make-array length :element-type '(:unsigned-byte 8)))
+      (setf post-data (make-array length :element-type '(unsigned-byte 8)))
       (funcall (make-parse-length-post-data-data 0 length)
                buffer start end request))))
 
