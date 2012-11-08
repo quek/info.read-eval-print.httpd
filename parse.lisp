@@ -62,7 +62,7 @@
       (error 'invalid-request))
     (let* ((name (octets-to-string buffer :start start :end colon))
            (value (octets-to-string buffer :start (1+ colon) :end end))
-           (key (intern (concatenate 'string "HTTP-" (substitute #\- #\_ (string-upcase name)))
+           (key (intern (substitute #\- #\_ (string-upcase name))
                         :keyword)))
       (setf (env request key) (string-left-trim #(#\space) value)))))
 
@@ -91,7 +91,7 @@
          (values t (1+ start) nil))
         (t
          (incf start)
-         (if (string= (env request :http-transfer-encoding) "chunked")
+         (if (string= (env request :transfer-encoding) "chunked")
              (parse-chunked-post-data buffer start end request)
              (pares-length-post-data buffer start end request)))))
 
@@ -140,7 +140,7 @@
 
 (defun pares-length-post-data (buffer start end request)
   (with-slots (post-data) request
-    (let ((length (parse-integer (env request :http-content-length))))
+    (let ((length (parse-integer (env request :content-length))))
       (setf post-data (make-array length :element-type '(unsigned-byte 8)))
       (funcall (make-parse-length-post-data-data 0 length)
                buffer start end request))))

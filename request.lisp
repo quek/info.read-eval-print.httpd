@@ -51,7 +51,7 @@
      (plusp (slot-value *server* 'keep-alive-timeout)))))
 
 (defmethod authorization ((request request))
-  (let ((authorization (env request :http-authorization)))
+  (let ((authorization (env request :authorization)))
     (ppcre:register-groups-bind (data) ("Basic \(.*\)" authorization)
       (let ((user-password (base64:base64-string-to-string data)))
         (awhen (position #\: user-password)
