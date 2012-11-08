@@ -174,12 +174,17 @@ app
 
 (defmethod unauthorized ((stream response-stream) &optional (realm "Common Lisp"))
   (setf (response-status-of stream) 401)
-  (add-header stream "WWW-Authenticate" (format nil "Basic realm=\"~a\"" realm)))
+  (add-header stream "WWW-Authenticate" (format nil "Basic realm=\"~a\"" realm))
+  (format stream "<head><title>401</title></head><body>Authorization Required</body>"))
 
 (defmethod redirect ((stream response-stream) url)
   (setf (response-status-of stream) 302)
-  (add-header stream "Location" url))
+  (add-header stream "Location" url)
+  (format stream "<head><title>302</title></head><body><a href=\"~a\">here</a></body>"
+          (h url)))
 
 (defmethod redirect-permanently ((stream response-stream) url)
   (setf (response-status-of stream) 301)
-  (add-header stream "Location" url))
+  (add-header stream "Location" url)
+  (format stream "<head><title>301</title></head><body><a href=\"~a\">here</a></body>"
+          (h url)))
