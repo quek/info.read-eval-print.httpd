@@ -21,4 +21,8 @@
           #:call
           #:env
           #:params
-          #:with-params))
+          #:with-params
+
+          #:*app-error-handler*
+          #:default-app-error-handler
+          #:ignore-app-error-handler))

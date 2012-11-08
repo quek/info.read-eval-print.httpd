@@ -164,10 +164,15 @@
         for event-fd = (cffi:foreign-slot-value
                         (cffi:foreign-slot-value event 'isys:epoll-event 'isys:data)
                         'isys:epoll-data 'isys:fd)
-        if (= event-fd pipe-read-fd)
-          do (add-to-epoll-wait pipe-read-fd)
-        else
-          do (dispatch-epoll-event event-fd event))
+        do (handler-case
+               (if (= event-fd pipe-read-fd)
+                   (add-to-epoll-wait pipe-read-fd)
+                   (dispatch-epoll-event event-fd event))
+             (error (e)
+               (format *error-output* "~a" e)
+               (ignore-errors
+                (funcall (gethash event-fd *dispatch-hup-table* 'close-connection)
+                         *server* event-fd)))))
   (iomux::expire-pending-timers *timers* (isys:get-monotonic-time)))
 
 ;; TODO defstruct thread-data とかして引数をまとてめる。

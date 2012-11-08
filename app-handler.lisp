@@ -1,5 +1,7 @@
 (in-package :info.read-eval-print.httpd)
 
+(defparameter *app-error-handler* 'default-app-error-handler)
+
 (defgeneric call (app request))
 (defgeneric app-handler-thread-fds (app-handler))
 
@@ -39,13 +41,29 @@
 
 (defun app-handler-loop (mailbox)
   (loop for request = (sb-concurrency:receive-message mailbox)
-        do (describe request)
         do (with-slots (accept-thread-fd fd) request
              (let ((*standard-output* (make-response-stream request)))
-               (call (env request :application) request)
-               (force-output *standard-output*)
-               (reset-request request)
-               (return-client-fd fd accept-thread-fd)))))
+               (handler-case (call (env request :application) request)
+                 (iolib.syscalls::epipe ()) ;ignore
+                 (error (e)
+                   (funcall *app-error-handler* e request *standard-output*)))
+               (handler-case
+                   (progn
+                    (force-output *standard-output*)
+                    (reset-request request)
+                    (return-client-fd fd accept-thread-fd))
+                 (iolib.syscalls::epipe ()) ;ignore
+                 (error (e)
+                   (funcall *app-error-handler* e request *standard-output*)))))))
+
+(defun default-app-error-handler (error request response)
+  (declare (ignore request response))
+  (format *error-output* "~a" error)
+  (error error))
+
+(defun ignore-app-error-handler (error request response)
+  (declare (ignore request response))
+  (format *error-output* "~a" error))
 
 (defmethod initialize-instance :after ((self app-handler) &key)
   (with-slots (number-of-threads mailbox threads) self
