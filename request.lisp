@@ -29,9 +29,17 @@
 (defclass http-1.1-request (request)
   ())
 
-
 (defmethod make-response-stream (request)
-  (make-instance 'response-stream :fd (slot-value request 'fd)))
+  (make-instance 'content-length-response-stream
+                 :fd (slot-value request 'fd)
+                 :protocol (env request :server-protocol)
+                 :request request))
+
+(defmethod make-response-stream ((request http-1.1-request))
+  (make-instance 'chunked-response-stream
+                 :fd (slot-value request 'fd)
+                 :protocol (env request :server-protocol)
+                 :request request))
 
 (defmethod env ((request request) key &optional default-value)
   (with-slots (env) request

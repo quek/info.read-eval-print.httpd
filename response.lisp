@@ -17,22 +17,40 @@ app
 (defclass response-stream (trivial-gray-streams:trivial-gray-stream-mixin
                            trivial-gray-streams:fundamental-binary-output-stream
                            trivial-gray-streams:fundamental-character-output-stream)
-  ((fd :initarg :fd :accessor fd-of)
+  ((fd :initarg :fd)
+   (protocol :initarg :protocol :initform "HTTP/1.1")
    (external-format :initarg :external-format :initform :utf-8
                     :accessor external-format-of)
    (response-status :initarg :response-status :initform 200
                     :accessor response-status-of)
    (response-headers :initarg :respone-headens
                      :initform (list (cons "Date" (rfc-2822-now))
-                                     (cons "Content-Type" "text/html; charset=UTF-8")
-                                     (cons "Transfer-Encoding" "chunked"))
+                                     (cons "Content-Type" "text/html; charset=UTF-8"))
                      :accessor response-headers-of)
-   (started :initform nil :accessor started-p)))
+   (started :initform nil :accessor started-p)
+   (request :initarg :request)))
+
+(defclass content-length-response-stream (response-stream)
+  ((buffer :initform nil)))
+
+(defclass chunked-response-stream (response-stream)
+  ())
+
+(defmethod initialize-instance :after ((stream chunked-response-stream) &key)
+  (add-header stream "Transfer-Encoding" "chunked"))
 
 (defmethod trivial-gray-streams:stream-force-output ((stream response-stream))
+  (with-slots (fd) stream
+    (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 0)))
+
+(defmethod trivial-gray-streams:stream-force-output ((stream chunked-response-stream))
+  (with-slots (fd) stream
+    (%write-last-chunk fd)
+    (call-next-method)))
+
+(defmethod trivial-gray-streams:stream-force-output :before ((stream response-stream))
   (unless (started-p stream)
-    (start-response stream))
-  (%write-last-chunk (fd-of stream)))
+    (start-response stream)))
 
 (defmethod trivial-gray-streams:stream-write-sequence :before ((stream response-stream)
                                                                sequence start end &key)
@@ -48,16 +66,16 @@ app
 
 (declaim (inline %write-last-chunk))
 (defun %write-last-chunk (fd)
-  (%format-to-fd fd :latin-1 "0~a~a" +crlf+ +crlf+)
-  (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 0))
+  (%format-to-fd fd :latin-1 "0~a~a" +crlf+ +crlf+))
 
 (declaim (inline write-chunk))
 (defun write-chunk (stream buffer size)
-  (unless (started-p stream)
-    (start-response stream))
-  (%write-chunk (fd-of stream) buffer size))
+  (with-slots (fd) stream
+    (unless (started-p stream)
+      (start-response stream))
+    (%write-chunk fd buffer size)))
 
-(defmethod trivial-gray-streams:stream-write-sequence ((stream response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
                                                        (string string) start end &key)
   (cffi:with-foreign-string ((s length) string
                              :encoding (external-format-of stream)
@@ -65,7 +83,7 @@ app
                              :start start :end end)
     (write-chunk stream s length)))
 
-(defmethod trivial-gray-streams:stream-write-sequence ((stream response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
                                                        sequence start end &key)
   (cffi-sys:with-pointer-to-vector-data (ptr sequence)
     (cffi-sys:inc-pointer ptr start)
@@ -77,7 +95,7 @@ app
   (unless (started-p stream)
     (start-response stream)))
 
-(defmethod trivial-gray-streams:stream-write-string ((stream response-stream) (string string)
+(defmethod trivial-gray-streams:stream-write-string ((stream chunked-response-stream) (string string)
                                                      &optional (start 0) end)
   (cffi:with-foreign-string ((s length) string
                              :encoding (external-format-of stream)
@@ -139,24 +157,22 @@ app
     (505 "HTTP Version Not Supported")))
 
 (defmethod start-response-line ((stream response-stream))
-  (let ((fd (fd-of stream))
-        (external-format (external-format-of stream)))
+  (with-slots (fd protocol external-format) stream
     (%format-to-fd fd external-format
-                   "HTTP/1.1 ~d ~a~a"
+                   "~a ~d ~a~a"
+                   protocol
                    (response-status-of stream)
                    (response-message-of stream)
                    +crlf+)))
 
 (defmethod start-response-header ((stream response-stream))
-  (let ((fd (fd-of stream))
-        (external-format (external-format-of stream)))
+  (with-slots (fd external-format) stream
     (iterate (((k v) (scan-alist (response-headers-of stream))))
       (%format-to-fd fd external-format
-                     "~a: ~a~a" k v +crlf+))
-    (%format-to-fd fd external-format +crlf+)))
+                     "~a: ~a~a" k v +crlf+))))
 
 (defmethod start-response ((stream response-stream))
-  (let ((fd (fd-of stream)))
+  (with-slots (fd) stream
     (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 1)
     (start-response-line stream)
     (start-response-header stream)
