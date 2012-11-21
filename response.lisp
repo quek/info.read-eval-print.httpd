@@ -169,7 +169,8 @@ app
   (with-slots (fd external-format) stream
     (iterate (((k v) (scan-alist (response-headers-of stream))))
       (%format-to-fd fd external-format
-                     "~a: ~a~a" k v +crlf+))))
+                     "~a: ~a~a" k v +crlf+))
+    (%format-to-fd fd external-format "~a" +crlf+)))
 
 (defmethod start-response ((stream response-stream))
   (with-slots (fd) stream

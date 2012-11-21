@@ -59,7 +59,7 @@
 (defun default-app-error-handler (error request response)
   (declare (ignore request response))
   (format *error-output* "~a" error)
-  (error error))
+  (cerror "default-app-error-handler" error))
 
 (defun ignore-app-error-handler (error request response)
   (declare (ignore request response))
