@@ -1,3 +1,7 @@
+* TODO
+
 keepalive
+
+* DONE
 
 app-handler にわたった fd はブロックにして、終ったらノンブロックに戻す

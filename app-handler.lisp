@@ -17,11 +17,12 @@
                   :test (lambda (a b)
                           (ppcre:scan (format nil "^~a([/?].*|$)" (ppcre:quote-meta-chars b))
                                       a)))
-      (with-slots (accept-thread-fd response) request
+      (with-slots (accept-thread-fd fd response) request
         (setf (env request :script-name) (car it)
               (env request :path-info) (subseq (env request :path-info) (length (car it)))
               (env request :application) (cdr it)
-              accept-thread-fd *accept-thread-fd*)
+              accept-thread-fd *accept-thread-fd*
+              (isys:fd-nonblock fd) nil)
         (describe request)
         (sb-concurrency:send-message mailbox request)
         (setf *detach-p* t)
@@ -51,6 +52,7 @@
                    (progn
                     (force-output *standard-output*)
                     (reset-request request)
+                    (setf (isys:fd-nonblock fd) t)
                     (return-client-fd fd accept-thread-fd))
                  (iolib.syscalls::epipe ()) ;ignore
                  (error (e)
