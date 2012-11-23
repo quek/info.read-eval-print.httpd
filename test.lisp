@@ -1,13 +1,14 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (ql:quickload :hu.dwim.stefil+hu.dwim.def)
   (ql:quickload :info.read-eval-print.httpd)
+  (ql:quickload :info.read-eval-print.html)
   (ql:quickload :drakma))
 
 (setq drakma:*drakma-default-external-format* :utf-8)
 
 (info.read-eval-print.series-ext:sdefpackage
  :info.read-eval-print.httpd.test
- (:use :cl :info.read-eval-print.httpd)
+ (:use :cl :info.read-eval-print.httpd :info.read-eval-print.html)
  (:import-from :info.read-eval-print.httpd #:+crlf+))
 
 (in-package :info.read-eval-print.httpd.test)
@@ -30,10 +31,24 @@
 
 (defvar *test-server*)
 
+(defclass test-app ()
+  ())
+
+(defun /hello ()
+  (html (:html
+          (:head (:title "hello"))
+          (:body (:h1 "hello")
+                 (:p "hello")))))
+
+(defmethod call ((app test-app) request)
+  (let ((*html-output* *standard-output*))
+    (/hello)))
+
 (defun start-test-server (&optional (handler (make-instance 'info.read-eval-print.httpd:default-handler)))
   (setf *test-server*
         (make-instance 'info.read-eval-print.httpd:server
                        :document-root *test-document-root*
+                       :application 'test-app
                        :handler handler
                        :port *test-port*))
   (sb-thread:make-thread
@@ -81,11 +96,6 @@
   (hu.dwim.stefil:is (string= (path-content "/index.html")
                               (drakma:http-request (url "/index.html")))))
 
-#+(or)
-(hu.dwim.stefil:deftest test-cgi-hello ()
-  (hu.dwim.stefil:is (ppcre:scan "<h1>Hello, World!</h1>"
-                                 (drakma:http-request (url "/cgi-bin/hello.cgi")))))
-
 (hu.dwim.stefil:deftest test-post ()
   (multiple-value-bind (content code)
       (drakma:http-request (format nil "http://~a:~a/index.html" *test-host* *test-port*)
@@ -97,17 +107,22 @@
     (multiple-value-bind (content code)
       (drakma:http-request (format nil "http://~a:~a/index.html" *test-host* *test-port*)
                            :method :post
-                           :content-length 11 
+                           :content-length 11
                            :parameters ' (("ab" . "cd")
                                           ("ef" . "gh")))
       (declare (ignore content))
       (hu.dwim.stefil:is (= 200 code))))
 
+
+
+(hu.dwim.stefil:deftest test-get-http/1.0 ()
+  (hu.dwim.stefil:is (string= (with-output-to-string (*html-output*)
+                                (/hello))
+                              (drakma:http-request (url "/hello")
+                                                   :protocol :http/1.0))))
+
+
+
+
+
 (info.read-eval-print.httpd.test)
-
-#|
-(make-instance 'info.read-eval-print.httpd:server
-               :application '("/my-app" my-app))
-
-(install-application server my-app :context-root "/my-app")
-|#

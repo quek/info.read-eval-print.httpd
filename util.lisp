@@ -1,5 +1,14 @@
 (in-package :info.read-eval-print.httpd)
 
+(deftype octet ()
+  '(unsigned-byte 8))
+
+(defun make-octet-vector (size)
+  (make-array size :element-type 'octet))
+
+(defun octet-vector (&rest octets)
+  (make-array (length octets) :element-type 'octet :initial-contents octets))
+
 (alexandria:define-constant +crlf+ (format nil "~c~c" #\cr #\lf) :test #'equalp)
 
 (defun string-to-octets (string &key (external-format :utf-8)

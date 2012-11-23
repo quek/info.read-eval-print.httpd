@@ -43,20 +43,21 @@
 (defun app-handler-loop (mailbox)
   (loop for request = (sb-concurrency:receive-message mailbox)
         do (with-slots (accept-thread-fd fd) request
-             (let ((*standard-output* (make-response-stream request)))
-               (handler-case (call (env request :application) request)
-                 (iolib.syscalls::epipe ()) ;ignore
-                 (error (e)
-                   (funcall *app-error-handler* e request *standard-output*)))
-               (handler-case
-                   (progn
-                    (force-output *standard-output*)
-                    (reset-request request)
-                    (setf (isys:fd-nonblock fd) t)
-                    (return-client-fd fd accept-thread-fd))
-                 (iolib.syscalls::epipe ()) ;ignore
-                 (error (e)
-                   (funcall *app-error-handler* e request *standard-output*)))))))
+             (unwind-protect
+                  (let ((*standard-output* (make-response-stream request)))
+                    (handler-case (call (env request :application) request)
+                      (iolib.syscalls::epipe ()) ;ignore
+                      (error (e)
+                        (funcall *app-error-handler* e request *standard-output*)))
+                    (handler-case
+                        (progn
+                          (force-output *standard-output*)
+                          (reset-request request)
+                          (setf (isys:fd-nonblock fd) t))
+                      (iolib.syscalls::epipe ()) ;ignore
+                      (error (e)
+                        (funcall *app-error-handler* e request *standard-output*))))
+               (return-client-fd fd accept-thread-fd)))))
 
 (defun default-app-error-handler (error request response)
   (declare (ignore request response))

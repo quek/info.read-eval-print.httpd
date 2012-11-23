@@ -39,41 +39,36 @@ app
 (defmethod initialize-instance :after ((stream chunked-response-stream) &key)
   (add-header stream "Transfer-Encoding" "chunked"))
 
-(defmethod trivial-gray-streams:stream-force-output ((stream response-stream))
+(defmethod trivial-gray-streams:stream-force-output :after ((stream response-stream))
   (with-slots (fd) stream
     (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 0)))
 
+(defmethod trivial-gray-streams:stream-force-output ((stream content-length-response-stream))
+  (with-slots (fd buffer) stream
+    (loop for i in (nreverse buffer)
+          do (cffi-sys:with-pointer-to-vector-data (ptr i)
+               (isys:write fd ptr (length i))))))
+
 (defmethod trivial-gray-streams:stream-force-output ((stream chunked-response-stream))
   (with-slots (fd) stream
-    (%write-last-chunk fd)
-    (call-next-method)))
+    (%write-last-chunk fd)))
 
 (defmethod trivial-gray-streams:stream-force-output :before ((stream response-stream))
   (unless (started-p stream)
     (start-response stream)))
 
-(defmethod trivial-gray-streams:stream-write-sequence :before ((stream response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence :before ((stream chunked-response-stream)
                                                                sequence start end &key)
   (unless (started-p stream)
     (start-response stream)))
 
-(declaim (inline %write-chunk))
-(defun %write-chunk (fd buffer size)
-  (unless (zerop size)
-    (%format-to-fd fd :latin-1 "~X~a" size +crlf+)
-    (isys:write fd buffer size)
-    (%format-to-fd fd :latin-1 +crlf+)))
-
-(declaim (inline %write-last-chunk))
-(defun %write-last-chunk (fd)
-  (%format-to-fd fd :latin-1 "0~a~a" +crlf+ +crlf+))
-
-(declaim (inline write-chunk))
-(defun write-chunk (stream buffer size)
-  (with-slots (fd) stream
-    (unless (started-p stream)
-      (start-response stream))
-    (%write-chunk fd buffer size)))
+(defmethod trivial-gray-streams:stream-write-sequence ((stream content-length-response-stream)
+                                                       (string string) start end &key)
+  (with-slots (buffer) stream
+    (push (string-to-octets string :external-format (external-format-of stream)
+                                   :start start
+                                   :end end)
+          buffer)))
 
 (defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
                                                        (string string) start end &key)
@@ -83,17 +78,27 @@ app
                              :start start :end end)
     (write-chunk stream s length)))
 
+(defmethod trivial-gray-streams:stream-write-sequence ((stream content-length-response-stream)
+                                                       sequence start end &key)
+  (with-slots (buffer) stream
+    (push (octet-vector (subseq sequence start end)) buffer)))
+
 (defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
                                                        sequence start end &key)
   (cffi-sys:with-pointer-to-vector-data (ptr sequence)
     (cffi-sys:inc-pointer ptr start)
     (write-chunk stream ptr (- end start))))
 
-(defmethod trivial-gray-streams:stream-write-string :before ((stream response-stream) string
+(defmethod trivial-gray-streams:stream-write-string :before ((stream chunked-response-stream) string
                                                              &optional start end)
   (declare (ignore start end))
   (unless (started-p stream)
     (start-response stream)))
+
+(defmethod trivial-gray-streams:stream-write-string ((stream content-length-response-stream)
+                                                     (string string)
+                                                     &optional (start 0) end)
+  (trivial-gray-streams:stream-write-sequence stream string start end))
 
 (defmethod trivial-gray-streams:stream-write-string ((stream chunked-response-stream) (string string)
                                                      &optional (start 0) end)
@@ -102,10 +107,6 @@ app
                              :null-terminated-p nil
                              :start start :end (or end (length string)))
     (write-chunk stream s length)))
-
-(defmethod trivial-gray-streams:stream-write-char :before ((stream response-stream) character)
-  (unless (started-p stream)
-    (start-response stream)))
 
 (defmethod trivial-gray-streams:stream-write-char ((stream response-stream) character)
   (trivial-gray-streams:stream-write-sequence stream (make-string 1 :initial-element character)
@@ -179,6 +180,10 @@ app
     (start-response-header stream)
     (setf (started-p stream) t)))
 
+(defmethod start-response :before ((stream content-length-response-stream))
+  (with-slots (buffer) stream
+    (add-header stream "Content-Length" (loop for i in buffer sum (length i)))))
+
 
 (defun %format-to-fd (fd exteral-format format &rest args)
   (cffi:with-foreign-string ((s length) (apply #'format nil format args)
@@ -205,3 +210,22 @@ app
   (add-header stream "Location" url)
   (format stream "<head><title>301</title></head><body><a href=\"~a\">here</a></body>"
           (h url)))
+
+
+(declaim (inline %write-chunk))
+(defun %write-chunk (fd buffer size)
+  (unless (zerop size)
+    (%format-to-fd fd :latin-1 "~X~a" size +crlf+)
+    (isys:write fd buffer size)
+    (%format-to-fd fd :latin-1 +crlf+)))
+
+(declaim (inline %write-last-chunk))
+(defun %write-last-chunk (fd)
+  (%format-to-fd fd :latin-1 "0~a~a" +crlf+ +crlf+))
+
+(declaim (inline write-chunk))
+(defun write-chunk (stream buffer size)
+  (with-slots (fd) stream
+    (unless (started-p stream)
+      (start-response stream))
+    (%write-chunk fd buffer size)))

@@ -140,7 +140,9 @@
   (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
     (let ((fd (cffi:mem-aref buf :int 0)))
       (sif (gethash fd *fd-hash*)
-           (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
+           (if (keep-alive-p it)
+               (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
+               (close-connection *server* fd))
            (progn
              (setf it (make-instance 'request :fd fd))
              (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))))
