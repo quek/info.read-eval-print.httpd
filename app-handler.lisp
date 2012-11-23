@@ -66,7 +66,7 @@
 
 (defun ignore-app-error-handler (error request response)
   (declare (ignore request response))
-  (format *error-output* "~a" error))
+  (warn (format nil "~a" error)))
 
 (defmethod initialize-instance :after ((self app-handler) &key)
   (with-slots (number-of-threads mailbox threads) self
