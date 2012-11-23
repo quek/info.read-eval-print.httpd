@@ -2,6 +2,8 @@
 
 keepalive
 
+停止
+
 * DONE
 
 app-handler にわたった fd はブロックにして、終ったらノンブロックに戻す
