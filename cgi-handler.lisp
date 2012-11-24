@@ -28,7 +28,7 @@
                            (write-string s response-stream)
                            (force-output response-stream)
                            (reset-request request))
-                         (return-client-fd fd *accept-thread-fd*))))
+                         (return-client-fd fd (slot-value request 'pipe-write-fd)))))
         #+nil
         (sb-ext:run-program
          "/bin/sh" (list path)
@@ -43,7 +43,7 @@
                         (print (list :status-hook process))
                         (force-output response-stream)
                         (reset-request request)
-                        (return-client-fd fd *accept-thread-fd*))))
+                        (return-client-fd fd (slot-value request 'pipe-write-fd)))))
       t)))
 
 (defmethod start-response-header ((stream cgi-response-stream)))

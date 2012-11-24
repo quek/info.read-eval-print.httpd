@@ -11,7 +11,13 @@
    (remain-request-buffer :initform nil)
    (accept-thread-fd)
    (post-data :initform nil)
-   (params)))
+   (params)
+   (pipe-write-fd :initarg :pipe-write-fd)
+   (close-function :initform nil)
+   (server :initarg :server)
+   (fd-hash :initarg :fd-hash)
+   (epoll-fd :initarg :epoll-fd)
+   (timers :initarg :timers)))
 
 (defmethod reset-request ((request request))
   (with-slots (env parse-function remain-request-buffer) request

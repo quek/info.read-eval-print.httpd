@@ -2,6 +2,7 @@
   :serial t
   :components ((:file "package")
                (:file "util")
+               (:file "ffi")
                (:file "parse")
                (:file "request")
                (:file "response")

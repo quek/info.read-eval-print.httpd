@@ -123,5 +123,8 @@
 (defun rfc-2822-posix (posix-time)
   (%rfc-2822 (decode-universal-time (+ posix-time +posix-epoch+))))
 
+(defvar %%%%lock (sb-thread:make-mutex))
 
-
+(defmacro with-global-lock (&body body)
+  `(sb-thread:with-recursive-lock (%%%%lock)
+     ,@body))

@@ -17,16 +17,13 @@
                   :test (lambda (a b)
                           (ppcre:scan (format nil "^~a([/?].*|$)" (ppcre:quote-meta-chars b))
                                       a)))
-      (with-slots (accept-thread-fd fd response) request
+      (with-slots (pipe-write-fd fd response close-function) request
         (setf (env request :script-name) (car it)
               (env request :path-info) (subseq (env request :path-info) (length (car it)))
               (env request :application) (cdr it)
-              accept-thread-fd *accept-thread-fd*
               (isys:fd-nonblock fd) nil)
-        (describe request)
         (sb-concurrency:send-message mailbox request)
-        (setf *detach-p* t)
-        t))))
+        :detach))))
 
 (defmethod install-application ((handler app-handler) (application symbol) &key context-root)
   (install-application handler (make-instance application) :context-root context-root))
@@ -35,29 +32,27 @@
   (with-slots (apps) handler
     (setf apps (acons context-root application apps))))
 
-(defun return-client-fd (client-fd accept-thread-fd)
+(defun return-client-fd (client-fd pipe-write-fd)
   (cffi:with-foreign-object (buf :int)
     (setf (cffi:mem-aref buf :int 0) client-fd)
-    (isys:write accept-thread-fd buf #.(cffi:foreign-type-size :int))))
+    (isys:write pipe-write-fd buf #.(cffi:foreign-type-size :int))))
 
 (defun app-handler-loop (mailbox)
   (loop for request = (sb-concurrency:receive-message mailbox)
-        do (with-slots (accept-thread-fd fd) request
-             (unwind-protect
-                  (let ((*standard-output* (make-response-stream request)))
-                    (handler-case (call (env request :application) request)
-                      (iolib.syscalls::epipe ()) ;ignore
-                      (error (e)
-                        (funcall *app-error-handler* e request *standard-output*)))
-                    (handler-case
-                        (progn
-                          (force-output *standard-output*)
-                          (reset-request request)
-                          (setf (isys:fd-nonblock fd) t))
-                      (iolib.syscalls::epipe ()) ;ignore
-                      (error (e)
-                        (funcall *app-error-handler* e request *standard-output*))))
-               (return-client-fd fd accept-thread-fd)))))
+        do (with-slots (pipe-write-fd fd) request
+             (let ((*standard-output* (make-response-stream request)))
+               (handler-case
+                   (progn
+                     (call (env request :application) request)
+                     (force-output *standard-output*)
+                     (reset-request request)
+                     (setf (isys:fd-nonblock fd) t)
+                     (return-client-fd fd pipe-write-fd))
+                 (iolib.syscalls::epipe ()
+                   (iolib.syscalls:close fd))
+                 (error (e)
+                   (iolib.syscalls:close fd)
+                   (funcall *app-error-handler* e request *standard-output*)))))))
 
 (defun default-app-error-handler (error request response)
   (declare (ignore request response))

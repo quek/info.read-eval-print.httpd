@@ -22,11 +22,6 @@
   (format nil "HTTP/1.0 200 OK~c~cLast-modified: Thu, 1 Jan 1970 00:00:00 GMT~c~c~c~c"
           #\cr #\lf #\cr #\lf #\cr #\lf))
 
-(isys:defsyscall (%sendfile "sendfile") :int
-  (out-fd :int)
-  (in-fd :int)
-  (offset (:pointer isys::off-t))
-  (count isys::size-t))
 
 (alexandria:define-constant +url-decode-table+
     (let ((array (make-array 255 :element-type 'fixnum
@@ -74,7 +69,7 @@
 (defgeneric accept (server))
 (defgeneric receive-request (server fd))
 (defgeneric send-response (server fd))
-(defgeneric close-connection (server fd))
+(defgeneric close-connection (fd-or-request))
 
 (defclass server ()
   ((document-root :initarg :document-root :initform "/usr/share/doc")
@@ -117,12 +112,11 @@
 (defvar *timers*)
 (defvar *epoll-fd*)
 (defvar *buffer*)
-(defvar *accept-thread-fd*)
 (defvar *request*)
 (defvar *dispatch-in-table*)
 (defvar *dispatch-out-table*)
 (defvar *dispatch-hup-table*)
-(defvar *detach-p* nil)
+
 
 (defun set-keep-alive-timer (fd request)
   (with-slots (keep-alive-timer) request
@@ -130,21 +124,26 @@
       (let ((timer (iomux::make-timer
                     (lambda ()
                       (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
-                      (close-connection *server* fd))
+                      (close-connection fd))
                     (slot-value *server* 'keep-alive-timeout)
                     :one-shot t)))
         (setf keep-alive-timer timer)
         (iomux::schedule-timer *timers* timer)))))
 
-(defun add-to-epoll-wait (pipe-fd)
-  (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-fd buf #.(cffi:foreign-type-size :int))
+(declaim (inline add-to-epoll-wait))
+(defun add-to-epoll-wait (pipe-read-fd pipe-write-fd)
+  (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-read-fd buf #.(cffi:foreign-type-size :int))
     (let ((fd (cffi:mem-aref buf :int 0)))
       (sif (gethash fd *fd-hash*)
            (if (keep-alive-p it)
                (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
-               (close-connection *server* fd))
+               (close-connection fd))
            (progn
-             (setf it (make-instance 'request :fd fd))
+             (setf it (make-instance 'request :fd fd :pipe-write-fd pipe-write-fd
+                                              :server *server*
+                                              :fd-hash *fd-hash*
+                                              :epoll-fd *epoll-fd*
+                                              :timers *timers*))
              (epoll-ctl fd *epoll-fd* isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))))
 
 (defun dispatch-epoll-event (fd event)
@@ -156,11 +155,13 @@
            (funcall (gethash fd *dispatch-out-table* 'send-response)
                     *server* fd))
           ((logtest event-mask isys:epollhup)
-           (funcall (gethash fd *dispatch-hup-table* 'close-connection)
+           (funcall (gethash fd *dispatch-hup-table* (lambda (server fd)
+                                                       (declare (ignore server))
+                                                       (close-connection fd)))
                     *server* fd)))))
 
-;; (declaim (inline handle-events))
-(defun handle-events (events ready-fds pipe-read-fd)
+(declaim (inline handle-events))
+(defun handle-events (events ready-fds pipe-read-fd pipe-write-fd)
   (loop for i below ready-fds
         for event = (cffi:mem-aref events 'isys:epoll-event i)
         for event-fd = (cffi:foreign-slot-value
@@ -168,16 +169,19 @@
                         'isys:epoll-data 'isys:fd)
         do (handler-case
                (if (= event-fd pipe-read-fd)
-                   (add-to-epoll-wait pipe-read-fd)
+                   (add-to-epoll-wait pipe-read-fd pipe-write-fd)
                    (dispatch-epoll-event event-fd event))
              (error (e)
-               (format *error-output* "~a" e)
+               (warn "~a" e)
                (ignore-errors
-                (funcall (gethash event-fd *dispatch-hup-table* 'close-connection)
+                (funcall (gethash event-fd *dispatch-hup-table*
+                                  (lambda (server fd)
+                                    (declare (ignore server))
+                                    (close-connection fd)))
                          *server* event-fd)))))
   (iomux::expire-pending-timers *timers* (isys:get-monotonic-time)))
 
-;; TODO defstruct thread-data とかして引数をまとてめる。
+;; TODO defstruct thread-data とかして引数をまとめる。
 (defun start-handler-thread (server fd-hash timers epoll-fd pipe-read-fd pipe-write-fd
                              dispatch-in-table dispatch-out-table dispatch-hup-table)
   (let ((*server* server)
@@ -185,19 +189,18 @@
         (*timers* timers)
         (*epoll-fd* epoll-fd)
         (*buffer* (make-array (slot-value server 'default-buffer-size) :element-type '(unsigned-byte 8)))
-        (*accept-thread-fd* pipe-write-fd)
         (*dispatch-in-table* dispatch-in-table)
         (*dispatch-out-table* dispatch-out-table)
         (*dispatch-hup-table* dispatch-hup-table))
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
-          (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
-          (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+
-                                                    500)
-                                  (isys:eintr ()
-                                    (warn "epoll-wait EINTR")
-                                    0))
-                until (quit-p server)
-                do (handle-events events ready-fds pipe-read-fd)))))
+      (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
+      (loop for ready-fds = (handler-case (isys:epoll-wait *epoll-fd* events iomux::+epoll-max-events+
+                                                           500)
+                              (isys:eintr ()
+                                (warn "epoll-wait EINTR")
+                                0))
+            until (quit-p server)
+            do (handle-events events ready-fds pipe-read-fd pipe-write-fd)))))
 
 (defun start-accept-thread (server)
   (let ((*server* server)
@@ -304,22 +307,29 @@
                           (iolib.syscalls:econnreset () -1))))
         (if (plusp read-size)
             (parse-request server fd *buffer* (+ start read-size) request)
-            (close-connection server fd))))))
+            (close-connection fd))))))
 
-(defun reset-client-fd-for-keep-alive (fd)
-  (reset-request *request*)
+(defun reset-client-fd-for-keep-alive (request fd)
+  (reset-request request)
   (epoll-ctl fd *epoll-fd* isys:epoll-ctl-mod isys:epollin isys:epollhup epollet))
 
 (defmethod send-response (server fd)
   (catch 'send-response
     (with-slots (document-root handler) server
-      (let ((*request* (gethash fd *fd-hash*))
-            (*detach-p* nil))
-        (handle-request handler server *request*)
-        (unless *detach-p*
-          (if (keep-alive-p *request*)
-              (reset-client-fd-for-keep-alive fd)
-              (close-connection server fd)))))))
+      (let ((request (gethash fd *fd-hash*)))
+        (case (handle-request handler server request)
+          (:detach
+           (detach-fd fd))
+          (t (if (keep-alive-p request)
+                 (reset-client-fd-for-keep-alive request fd)
+                 (close-connection fd))))))))
+
+(defun detach-fd (fd)
+  (let ((request (gethash fd *fd-hash*)))
+    (awhen (and request (slot-value request 'keep-alive-timer))
+      (iomux::unschedule-timer *timers* it))
+    (remhash fd *fd-hash*)
+    (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)))
 
 (defun status-message (status)
   (case status
@@ -381,12 +391,13 @@ Last-modified: ~a~a~
                      (iolib.syscalls:ewouldblock ()
                        (setf (gethash dist-fd *dispatch-out-table*)
                              (lambda (server dist-fd)
-                               (let ((*request* (gethash dist-fd *fd-hash*)))
+                               (declare (ignore server))
+                               (let ((request (gethash dist-fd *fd-hash*)))
                                  (sendfile-loop dist-fd src-fd offset length)
                                  (remhash dist-fd *dispatch-out-table*)
-                                 (if (keep-alive-p *request*)
-                                     (reset-client-fd-for-keep-alive dist-fd)
-                                     (close-connection server dist-fd)))))
+                                 (if (keep-alive-p request)
+                                     (reset-client-fd-for-keep-alive request dist-fd)
+                                     (close-connection dist-fd)))))
                        (throw 'send-response nil))
                      (error ()
                        (loop-finish)))
@@ -395,29 +406,11 @@ Last-modified: ~a~a~
   (isys:close src-fd)
   t)
 
-(defun %send-response (status headers body)
-  (with-slots (fd) *request*
-    (aif (cdr (assoc "X-Sendfile" headers :test #'equal))
-         (unless (sendfile fd it)
-           (error "X-Sendfile not found"))
-         (with-cork (fd)
-           (write-response (format nil "HTTP/1.1 ~d ~a~a" status (status-message status) +crlf+))
-           (write-response (collect-append
-                            'string
-                            (multiple-value-bind (k v) (scan-alist headers #'equal)
-                              (format nil "~a: ~a~a" k v +crlf+))))
-           (write-response +crlf+)
-           (collect-ignore (write-response (scan body)))
-           t))))
 
+(defmethod close-connection (fd)
+  (detach-fd fd)
+  (ignore-errors (isys:close fd)))
 
-(defmethod close-connection (server fd)
-  (let ((*request* (gethash fd *fd-hash*)))
-    (awhen (and *request* (slot-value *request* 'keep-alive-timer))
-      (iomux::unschedule-timer *timers* it)))
-  (remhash fd *fd-hash*)
-  (epoll-ctl fd *epoll-fd* isys:epoll-ctl-del)
-  (isys:close fd))
 
 (defclass sendfile-handler ()
   ())
