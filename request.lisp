@@ -9,15 +9,9 @@
    (keep-alive-timer :initform nil)
    (parse-function :initform nil)
    (remain-request-buffer :initform nil)
-   (accept-thread-fd)
    (post-data :initform nil)
    (params)
-   (pipe-write-fd :initarg :pipe-write-fd)
-   (close-function :initform nil)
-   (server :initarg :server)
-   (fd-hash :initarg :fd-hash)
-   (epoll-fd :initarg :epoll-fd)
-   (timers :initarg :timers)))
+   (thread-local :initarg :thread-local)))
 
 (defmethod reset-request ((request request))
   (with-slots (env parse-function remain-request-buffer) request
@@ -62,7 +56,7 @@
   ;; TODO Connection ヘッダ
   (with-slots (env) request
     (and
-     (plusp (slot-value *server* 'keep-alive-timeout)))))
+     (plusp (slot-value (thread-local-server *thread-local*) 'keep-alive-timeout)))))
 
 (defmethod authorization ((request request))
   (let ((authorization (env request :authorization)))
