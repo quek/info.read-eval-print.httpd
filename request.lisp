@@ -1,6 +1,6 @@
 (in-package :info.read-eval-print.httpd)
 
-(defgeneric keep-alive-p (request))
+(defgeneric keep-alive-p (server request))
 (defgeneric make-response-stream (request))
 
 (defclass request ()
@@ -11,7 +11,7 @@
    (remain-request-buffer :initform nil)
    (post-data :initform nil)
    (params)
-   (thread-local :initarg :thread-local)))
+   (pipe-write-fd :initarg :pipe-write-fd)))
 
 (defmethod reset-request ((request request))
   (with-slots (env parse-function remain-request-buffer) request
@@ -49,14 +49,14 @@
   (with-slots (env) request
     (setf (gethash key env) value)))
 
-(defmethod keep-alive-p (request)
+(defmethod keep-alive-p (server request)
   nil)
 
-(defmethod keep-alive-p ((request http-1.1-request))
+(defmethod keep-alive-p (server (request http-1.1-request))
   ;; TODO Connection ヘッダ
   (with-slots (env) request
     (and
-     (plusp (slot-value (thread-local-server *thread-local*) 'keep-alive-timeout)))))
+     (plusp (slot-value server 'keep-alive-timeout)))))
 
 (defmethod authorization ((request request))
   (let ((authorization (env request :authorization)))

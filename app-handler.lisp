@@ -39,16 +39,15 @@
 
 (defun app-handler-loop (mailbox)
   (loop for request = (sb-concurrency:receive-message mailbox)
-        do (with-slots (fd thread-local) request
-             (let ((*standard-output* (make-response-stream request))
-                   (*thread-local* thread-local))
+        do (with-slots (fd pipe-write-fd) request
+             (let ((*standard-output* (make-response-stream request)))
                (handler-case
                    (progn
                      (call (env request :application) request)
                      (force-output *standard-output*)
                      (reset-request request)
                      (setf (isys:fd-nonblock fd) t)
-                     (return-client-fd fd (thread-local-pipe-write-fd *thread-local*)))
+                     (return-client-fd fd pipe-write-fd))
                  (iolib.syscalls::epipe ()
                    (iolib.syscalls:close fd))
                  (error (e)

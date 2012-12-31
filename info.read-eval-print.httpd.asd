@@ -3,7 +3,6 @@
   :components ((:file "package")
                (:file "util")
                (:file "ffi")
-               (:file "thread-local")
                (:file "parse")
                (:file "request")
                (:file "response")

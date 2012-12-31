@@ -128,3 +128,24 @@
 (defmacro with-global-lock (&body body)
   `(sb-thread:with-recursive-lock (%%%%lock)
      ,@body))
+
+(defstruct queue
+  head
+  tail)
+
+(defun enqueue (queue x)
+  (let ((cons (cons x nil)))
+    (if (null (queue-tail queue))
+        (setf (queue-head queue) cons)
+        (setf (cdr (queue-tail queue)) cons))
+    (setf (queue-tail queue) cons)))
+
+(defun dequeue (queue)
+  (prog1 (car (queue-head queue))
+    (if (eq (queue-head queue) (queue-tail queue))
+        (setf (queue-head queue) nil
+              (queue-tail queue) nil)
+        (setf (queue-head queue) (cdr (queue-head queue))))))
+
+(defun queue-empty-p (queue)
+  (queue-head queue))

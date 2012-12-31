@@ -1,5 +1,18 @@
 (in-package :info.read-eval-print.httpd)
 
+(defvar *thread-local* nil "この変更はこのファイル内だけで使いましょう。")
+
+(defstruct thread-local
+  (server)
+  (fd-hash (make-hash-table))
+  (timers (iomux::make-priority-queue :key #'iomux::%timer-expire-time))
+  (epoll-fd (isys:epoll-create 1))
+  (buffer (make-octet-vector 4096))
+  (dispatch-in-table (make-hash-table))
+  (dispatch-out-table (make-hash-table))
+  (dispatch-hup-table (make-hash-table)))
+
+
 (defconstant epollet (ash 1 31))
 
 (defun epoll-ctl (fd epfd op &rest events)
@@ -108,27 +121,28 @@
 
 
 (defun set-keep-alive-timer (fd request)
-  (with-slots (keep-alive-timer) request
-    (when (and (keep-alive-p request) (not keep-alive-timer))
-      (let ((timer (iomux::make-timer
-                    (lambda ()
-                      (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
-                      (close-connection fd))
-                    (slot-value (thread-local-server *thread-local*) 'keep-alive-timeout)
-                    :one-shot t)))
-        (setf keep-alive-timer timer)
-        (iomux::schedule-timer (thread-local-timers *thread-local*) timer)))))
+  (let ((server (thread-local-server *thread-local*)))
+   (with-slots (keep-alive-timer) request
+     (when (and (keep-alive-p server request) (not keep-alive-timer))
+       (let ((timer (iomux::make-timer
+                     (lambda ()
+                       (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
+                       (close-connection fd))
+                     (slot-value server 'keep-alive-timeout)
+                     :one-shot t)))
+         (setf keep-alive-timer timer)
+         (iomux::schedule-timer (thread-local-timers *thread-local*) timer))))))
 
 (declaim (inline add-to-epoll-wait))
-(defun add-to-epoll-wait (pipe-read-fd)
+(defun add-to-epoll-wait (pipe-read-fd pipe-write-fd)
   (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-read-fd buf #.(cffi:foreign-type-size :int))
     (let ((fd (cffi:mem-aref buf :int 0)))
       (sif (gethash fd (thread-local-fd-hash *thread-local*))
-           (if (keep-alive-p it)
+           (if (keep-alive-p (thread-local-server *thread-local*) it)
                (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
                (close-connection fd))
            (progn
-             (setf it (make-instance 'request :fd fd :thread-local *thread-local*))
+             (setf it (make-instance 'request :fd fd :pipe-write-fd pipe-write-fd))
              (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))))
 
 (defun dispatch-epoll-event (fd event)
@@ -144,7 +158,7 @@
                     fd)))))
 
 (declaim (inline handle-events))
-(defun handle-events (events ready-fds pipe-read-fd)
+(defun handle-events (events ready-fds pipe-read-fd pipe-write-fd)
   (loop for i below ready-fds
         for event = (cffi:mem-aref events 'isys:epoll-event i)
         for event-fd = (cffi:foreign-slot-value
@@ -152,7 +166,7 @@
                         'isys:epoll-data 'isys:fd)
         do (handler-case
                (if (= event-fd pipe-read-fd)
-                   (add-to-epoll-wait pipe-read-fd)
+                   (add-to-epoll-wait pipe-read-fd pipe-write-fd)
                    (dispatch-epoll-event event-fd event))
              (error (e)
                (warn "~a" e)
@@ -163,8 +177,7 @@
   (iomux::expire-pending-timers (thread-local-timers *thread-local*) (isys:get-monotonic-time)))
 
 (defun start-handler-thread (server pipe-read-fd pipe-write-fd)
-  (let ((*thread-local* (make-thread-local :server server
-                                           :pipe-write-fd pipe-write-fd)))
+  (let ((*thread-local* (make-thread-local :server server)))
     (epoll-ctl pipe-read-fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-add isys:epollin)
     (cffi:with-foreign-object (events 'isys:epoll-event iomux::+epoll-max-events+)
       (isys:bzero events (* iomux::+epoll-max-events+ isys:size-of-epoll-event))
@@ -174,7 +187,7 @@
                                 (warn "epoll-wait EINTR")
                                 0))
             until (quit-p server)
-            do (handle-events events ready-fds pipe-read-fd)))))
+            do (handle-events events ready-fds pipe-read-fd pipe-write-fd)))))
 
 (defun start-accept-thread (server)
   (multiple-value-bind (pipe-read-fd pipe-write-fd) (sb-posix:pipe)
@@ -284,7 +297,7 @@
           (case (handle-request handler server request)
             (:detach
              (detach-fd fd))
-            (t (if (keep-alive-p request)
+            (t (if (keep-alive-p server request)
                    (reset-client-fd-for-keep-alive request fd)
                    (close-connection fd)))))))))
 
@@ -343,7 +356,7 @@ Last-modified: ~a~a~
                                (let ((request (gethash dist-fd (thread-local-fd-hash *thread-local*))))
                                  (sendfile-loop dist-fd src-fd offset length)
                                  (remhash dist-fd (thread-local-dispatch-out-table *thread-local*))
-                                 (if (keep-alive-p request)
+                                 (if (keep-alive-p (thread-local-server *thread-local*) request)
                                      (reset-client-fd-for-keep-alive request dist-fd)
                                      (close-connection dist-fd)))))
                        (throw 'send-response nil))

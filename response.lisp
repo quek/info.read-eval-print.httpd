@@ -31,7 +31,7 @@ app
    (request :initarg :request)))
 
 (defclass content-length-response-stream (response-stream)
-  ((buffer :initform nil)))
+  ((buffer :initform (make-queue))))
 
 (defclass chunked-response-stream (response-stream)
   ())
@@ -45,7 +45,7 @@ app
 
 (defmethod trivial-gray-streams:stream-force-output ((stream content-length-response-stream))
   (with-slots (fd buffer) stream
-    (loop for i in (nreverse buffer)
+    (loop for i in (queue-head buffer)
           do (cffi-sys:with-pointer-to-vector-data (ptr i)
                (isys:write fd ptr (length i))))))
 
@@ -65,10 +65,9 @@ app
 (defmethod trivial-gray-streams:stream-write-sequence ((stream content-length-response-stream)
                                                        (string string) start end &key)
   (with-slots (buffer) stream
-    (push (string-to-octets string :external-format (external-format-of stream)
-                                   :start start
-                                   :end end)
-          buffer)))
+    (enqueue buffer (string-to-octets string :external-format (external-format-of stream)
+                                             :start start
+                                             :end end))))
 
 (defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
                                                        (string string) start end &key)
@@ -81,7 +80,7 @@ app
 (defmethod trivial-gray-streams:stream-write-sequence ((stream content-length-response-stream)
                                                        sequence start end &key)
   (with-slots (buffer) stream
-    (push (octet-vector (subseq sequence start end)) buffer)))
+    (enqueue buffer (octet-vector (subseq sequence start end)))))
 
 (defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
                                                        sequence start end &key)
@@ -182,7 +181,7 @@ app
 
 (defmethod start-response :before ((stream content-length-response-stream))
   (with-slots (buffer) stream
-    (add-header stream "Content-Length" (loop for i in buffer sum (length i)))))
+    (add-header stream "Content-Length" (loop for i in (queue-head buffer) sum (length i)))))
 
 
 (defun %format-to-fd (fd exteral-format format &rest args)
