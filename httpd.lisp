@@ -1,6 +1,7 @@
 (in-package :info.read-eval-print.httpd)
 
-(defvar *thread-local* nil "この変更はこのファイル内だけで使いましょう。")
+(defvar *thread-local* nil "この変更はこのファイル内だけで使いましょう。
+parse.lisp でも使っちゃった。")
 
 (defstruct thread-local
   (server)
@@ -96,6 +97,27 @@
    (quit :initform nil :accessor quit-p)
    (accept-threads :initform nil)))
 
+(defclass ssl-server (server)
+  ((ssl-cert :initarg :ssl-cert :initform "/etc/ssl/certs/ssl-cert-snakeoil.pem")
+   (ssl-key :initarg :ssl-key :initform "/etc/ssl/private/ssl-cert-snakeoil.key")))
+
+(defgeneric ssl-p (server)
+  (:method (server)
+    nil)
+  (:method ((ssl-server ssl-server))
+    t))
+
+(defgeneric make-request (server &rest args)
+  (:method (server &rest args)
+    (apply #'make-instance 'request :server server args))
+  (:method ((server ssl-server) &rest args)
+    (with-slots (ssl-cert ssl-key) server
+      (apply #'make-instance 'ssl-request
+             :server server
+             :ssl-cert ssl-cert
+             :ssl-key ssl-key
+             args))))
+
 (defmethod initialize-instance :after ((server server) &key application applications)
   (with-slots (document-root) server
     (setf document-root
@@ -134,7 +156,7 @@
          (iomux::schedule-timer (thread-local-timers *thread-local*) timer))))))
 
 (declaim (inline add-to-epoll-wait))
-(defun add-to-epoll-wait (pipe-read-fd pipe-write-fd)
+(defun add-to-epoll-wait (server pipe-read-fd pipe-write-fd)
   (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-read-fd buf #.(cffi:foreign-type-size :int))
     (let ((fd (cffi:mem-aref buf :int 0)))
       (sif (gethash fd (thread-local-fd-hash *thread-local*))
@@ -142,7 +164,7 @@
                (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
                (close-connection fd))
            (progn
-             (setf it (make-instance 'request :fd fd :pipe-write-fd pipe-write-fd))
+             (setf it (make-request server :fd fd :pipe-write-fd pipe-write-fd))
              (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))))
 
 (defun dispatch-epoll-event (fd event)
@@ -158,7 +180,8 @@
                     fd)))))
 
 (declaim (inline handle-events))
-(defun handle-events (events ready-fds pipe-read-fd pipe-write-fd)
+(defgeneric handle-events (server events ready-fds pipe-read-fd pipe-write-fd))
+(defmethod handle-events ((server server) events ready-fds pipe-read-fd pipe-write-fd)
   (loop for i below ready-fds
         for event = (cffi:mem-aref events 'isys:epoll-event i)
         for event-fd = (cffi:foreign-slot-value
@@ -166,7 +189,7 @@
                         'isys:epoll-data 'isys:fd)
         do (handler-case
                (if (= event-fd pipe-read-fd)
-                   (add-to-epoll-wait pipe-read-fd pipe-write-fd)
+                   (add-to-epoll-wait server pipe-read-fd pipe-write-fd)
                    (dispatch-epoll-event event-fd event))
              (error (e)
                (warn "~a" e)
@@ -187,7 +210,7 @@
                                 (warn "epoll-wait EINTR")
                                 0))
             until (quit-p server)
-            do (handle-events events ready-fds pipe-read-fd pipe-write-fd)))))
+            do (handle-events server events ready-fds pipe-read-fd pipe-write-fd)))))
 
 (defun start-accept-thread (server)
   (multiple-value-bind (pipe-read-fd pipe-write-fd) (sb-posix:pipe)
@@ -202,7 +225,7 @@
             until (quit-p server)
             do (setf (isys:fd-nonblock client-fd) t)
                (setf (cffi:mem-aref buf :int 0) client-fd)
-               (sb-posix:write pipe-write-fd buf #.(cffi:foreign-type-size :int))))))
+               (sys-write pipe-write-fd buf #.(cffi:foreign-type-size :int))))))
 
 (defmethod start (server)
   (with-slots (port bind-address listen-socket listen-fd number-of-threads accept-threads) server
@@ -256,11 +279,13 @@
              (let* ((remain-size (- buffer-size position))
                     (new-buffer-size (* 2 (length buffer)))
                     (new-buffer (make-array new-buffer-size :element-type '(unsigned-byte 8))))
+               (replace new-buffer buffer :start2 position :end2 buffer-size)
+               #+nil
                (iterate ((si (scan-range :from position :below buffer-size))
                          (di (scan-range)))
                  (setf (aref new-buffer di) (aref buffer si)))
                (setf (thread-local-buffer *thread-local*) new-buffer)
-               (let ((read-size (receive fd (thread-local-buffer *thread-local*) remain-size new-buffer-size)))
+               (let ((read-size (receive-from request new-buffer remain-size new-buffer-size)))
                  (unless read-size
                    (setf remain-request-buffer (subseq (thread-local-buffer *thread-local*) 0 remain-size))
                    (return))
@@ -279,8 +304,8 @@
                         (setf (aref (thread-local-buffer *thread-local*) i) (aref buf i)))
                       (setf remain-request-buffer nil)
                       len))
-             (read-size (handler-case (receive fd (thread-local-buffer *thread-local*) start (length (thread-local-buffer *thread-local*)))
-                          (iolib.syscalls:econnreset () -1))))
+             (buffer (thread-local-buffer *thread-local*))
+             (read-size (receive-from request buffer start (length buffer))))
         (if (plusp read-size)
             (parse-request server fd (thread-local-buffer *thread-local*) (+ start read-size) request)
             (close-connection fd))))))
@@ -319,34 +344,44 @@
        (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
                                              iolib.sockets::tcp-cork 0))))
 
-(defun sendfile (fd path)
+(defgeneric sendfile (request fd path))
+(defmethod sendfile ((request request) fd path)
   (let* ((file-fd (handler-case (isys::open path isys:o-rdonly)
                     (isys:enoent ()
                       (warn "404 not found ~a" path)
                       (return-from sendfile nil))))
          (st (isys:fstat file-fd))
          (last-modified (rfc-2822-posix (isys:stat-mtime st)))
-         (content-length (isys:stat-size st)))
+         (content-length (isys:stat-size st))
+         (response (response-of request)))
     (with-cork (fd)
-      (cffi:with-foreign-string ((s length)
-                                 (format nil "~
+      (write-to-response response
+                         (format nil "~
 HTTP/1.1 200 OK~a~
 Content-Type: ~a~a~
 Content-Length: ~d~a~
 Date: ~a~a~
 Last-modified: ~a~a~
 ~a"
-                                         +crlf+
-                                         (path-mime-type path) +crlf+
-                                         content-length +crlf+
-                                         (rfc-2822-now) +crlf+
-                                         last-modified +crlf+
-                                         +crlf+)
-                                 :null-terminated-p nil)
-        (isys:write fd s length))
+                                 +crlf+
+                                 (path-mime-type path) +crlf+
+                                 content-length +crlf+
+                                 (rfc-2822-now) +crlf+
+                                 last-modified +crlf+
+                                 +crlf+)
+                         nil)
       (let ((offset (cffi:foreign-alloc :long :initial-element 0)))
         (sendfile-loop fd file-fd offset content-length)))
     t))
+
+(defmethod sendfile ((request ssl-request) fd path)
+  (let ((response (response-of request)))
+    (let ((buffer (make-octet-vector #1=4096))
+          (src (handler-case (open path :element-type '(unsigned-byte 8))
+                 (error ()
+                   (warn "404 not found ~a" path)
+                   (return-from sendfile nil)))))
+      (ssl-sendfile-loop response src buffer #1#))))
 
 (defun sendfile-loop (dist-fd src-fd offset length)
   (loop for done = (handler-case (%sendfile dist-fd src-fd offset length)
@@ -367,6 +402,26 @@ Last-modified: ~a~a~
   (isys:close src-fd)
   t)
 
+(defun ssl-sendfile-loop (dst src buffer bufsiz)
+  (loop  for len = (read-sequence buffer src :end bufsiz)
+         until (not (plusp len))
+         do (handler-case (write-sequence buffer dst :end len)
+              (iolib.syscalls:ewouldblock ()
+                (with-slots (fd) dst
+                  (setf (gethash fd (thread-local-dispatch-out-table *thread-local*))
+                        (lambda (fd)
+                          (let ((request (gethash fd (thread-local-fd-hash *thread-local*))))
+                            (ssl-sendfile-loop dst src buffer bufsiz)
+                            (remhash fd (thread-local-dispatch-out-table *thread-local*))
+                            (if (keep-alive-p (thread-local-server *thread-local*) request)
+                                (reset-client-fd-for-keep-alive request fd)
+                                (close-connection fd)))))
+                  (throw 'send-response nil)))
+              (error ()
+                (loop-finish))))
+  (force-output dst)
+  (close src)
+  t)
 
 (defmethod close-connection (fd)
   (detach-fd fd)
@@ -383,7 +438,7 @@ Last-modified: ~a~a~
                               (env request :path-info))))
       (when (and (fad:file-exists-p path)
                  (not (fad:directory-exists-p path)))
-        (sendfile fd path)))))
+        (sendfile request fd path)))))
 
 
 (defclass 404-handler ()
@@ -407,4 +462,9 @@ Last-modified: ~a~a~
 (info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server
                                                  :document-root "/tmp"))
 ab -n 10000 -c 10 'http://localhost:1958/sbcl-doc/html/index.html'
+
+(info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:ssl-server
+                                                 :ssl-cert "/home/ancient/letter/lisp/craft/info.read-eval-print.httpd/ssl/ssl.pem"
+                                                 :ssl-key "/home/ancient/letter/lisp/craft/info.read-eval-print.httpd/ssl/ssl.key"))
+
 |#

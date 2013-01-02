@@ -5,6 +5,7 @@
  (:use :cl :anaphora)
  (:export #:start
           #:server
+          #:ssl-server
           #:quit-p
 
           #:default-handler

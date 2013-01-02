@@ -16,4 +16,5 @@
                :trivial-gray-streams
                :sb-concurrency
                :percent-encoding
+               :cl+ssl
                :info.read-eval-print.series-ext))

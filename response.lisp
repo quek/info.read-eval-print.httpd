@@ -30,11 +30,43 @@ app
    (started :initform nil :accessor started-p)
    (request :initarg :request)))
 
+(defclass ssl-response-mixin ()
+  ((ssl-stream :initarg :ssl-stream)))
+
 (defclass content-length-response-stream (response-stream)
   ((buffer :initform (make-queue))))
 
+(defclass ssl-content-length-response-stream (ssl-response-mixin content-length-response-stream)
+  ())
+
 (defclass chunked-response-stream (response-stream)
   ())
+
+(defclass ssl-chunked-response-stream (ssl-response-mixin chunked-response-stream)
+  ())
+
+
+(defgeneric write-to-response (response buffer length))
+
+(defmethod write-to-response ((response response-stream) (buffer string) length)
+  (declare (ignore length))
+  (with-slots (fd) response
+   (cffi:with-foreign-string ((ptr size) buffer :null-terminated-p nil)
+     (sys-write fd ptr size))))
+
+(defmethod write-to-response ((response response-stream) buffer length)
+  (with-slots (fd) response
+    (typecase buffer
+      (octet-vector
+       (cffi-sys:with-pointer-to-vector-data (ptr buffer)
+         (sys-write fd ptr length)))
+      (t                                ;buffer must be a system area pointer.
+       (sys-write fd buffer length)))))
+
+(defmethod write-to-response ((response ssl-response-mixin) buffer length)
+  (with-slots (ssl-stream) response
+    (write-sequence buffer ssl-stream :end length)))
+
 
 (defmethod initialize-instance :after ((stream chunked-response-stream) &key)
   (add-header stream "Transfer-Encoding" "chunked"))
@@ -43,77 +75,83 @@ app
   (with-slots (fd) stream
     (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 0)))
 
+(defmethod trivial-gray-streams:stream-force-output :after ((stream ssl-response-mixin))
+  (with-slots (ssl-stream) stream
+    (force-output ssl-stream)))
+
 (defmethod trivial-gray-streams:stream-force-output ((stream content-length-response-stream))
   (with-slots (fd buffer) stream
     (loop for i in (queue-head buffer)
-          do (cffi-sys:with-pointer-to-vector-data (ptr i)
-               (isys:write fd ptr (length i))))))
+          do (write-to-response stream i (length i)))))
 
 (defmethod trivial-gray-streams:stream-force-output ((stream chunked-response-stream))
-  (with-slots (fd) stream
-    (%write-last-chunk fd)))
+  (%write-last-chunk stream))
 
 (defmethod trivial-gray-streams:stream-force-output :before ((stream response-stream))
   (unless (started-p stream)
     (start-response stream)))
 
-(defmethod trivial-gray-streams:stream-write-sequence :before ((stream chunked-response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence :before ((response chunked-response-stream)
                                                                sequence start end &key)
-  (unless (started-p stream)
-    (start-response stream)))
+  (unless (started-p response)
+    (start-response response)))
 
-(defmethod trivial-gray-streams:stream-write-sequence ((stream content-length-response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence ((response content-length-response-stream)
                                                        (string string) start end &key)
-  (with-slots (buffer) stream
-    (enqueue buffer (string-to-octets string :external-format (external-format-of stream)
+  (with-slots (buffer) response
+    (enqueue buffer (string-to-octets string :external-format (external-format-of response)
                                              :start start
                                              :end end))))
 
-(defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence ((response chunked-response-stream)
                                                        (string string) start end &key)
   (cffi:with-foreign-string ((s length) string
-                             :encoding (external-format-of stream)
+                             :encoding (external-format-of response)
                              :null-terminated-p nil
                              :start start :end end)
-    (write-chunk stream s length)))
+    (write-chunk response s length)))
 
-(defmethod trivial-gray-streams:stream-write-sequence ((stream content-length-response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence ((response content-length-response-stream)
                                                        sequence start end &key)
-  (with-slots (buffer) stream
+  (with-slots (buffer) response
     (enqueue buffer (octet-vector (subseq sequence start end)))))
 
-(defmethod trivial-gray-streams:stream-write-sequence ((stream chunked-response-stream)
+(defmethod trivial-gray-streams:stream-write-sequence ((response chunked-response-stream)
                                                        sequence start end &key)
   (cffi-sys:with-pointer-to-vector-data (ptr sequence)
     (cffi-sys:inc-pointer ptr start)
-    (write-chunk stream ptr (- end start))))
+    (write-chunk response ptr (- end start))))
 
-(defmethod trivial-gray-streams:stream-write-string :before ((stream chunked-response-stream) string
+(defmethod trivial-gray-streams:stream-write-sequence ((response ssl-chunked-response-stream)
+                                                       sequence start end &key)
+  (write-chunk response (subseq sequence start end) (- end start)))
+
+(defmethod trivial-gray-streams:stream-write-string :before ((response chunked-response-stream) string
                                                              &optional start end)
   (declare (ignore start end))
-  (unless (started-p stream)
-    (start-response stream)))
+  (unless (started-p response)
+    (start-response response)))
 
-(defmethod trivial-gray-streams:stream-write-string ((stream content-length-response-stream)
+(defmethod trivial-gray-streams:stream-write-string ((response content-length-response-stream)
                                                      (string string)
                                                      &optional (start 0) end)
-  (trivial-gray-streams:stream-write-sequence stream string start end))
+  (trivial-gray-streams:stream-write-sequence response string start end))
 
-(defmethod trivial-gray-streams:stream-write-string ((stream chunked-response-stream) (string string)
+(defmethod trivial-gray-streams:stream-write-string ((response chunked-response-stream) (string string)
                                                      &optional (start 0) end)
   (cffi:with-foreign-string ((s length) string
-                             :encoding (external-format-of stream)
+                             :encoding (external-format-of response)
                              :null-terminated-p nil
                              :start start :end (or end (length string)))
-    (write-chunk stream s length)))
+    (write-chunk response s length)))
 
-(defmethod trivial-gray-streams:stream-write-char ((stream response-stream) character)
-  (trivial-gray-streams:stream-write-sequence stream (make-string 1 :initial-element character)
+(defmethod trivial-gray-streams:stream-write-char ((response response-stream) character)
+  (trivial-gray-streams:stream-write-sequence response (make-string 1 :initial-element character)
                                               0 1))
 
 
-(defmethod response-message-of ((stream response-stream))
-  (ecase (response-status-of stream)
+(defmethod response-message-of ((response response-stream))
+  (ecase (response-status-of response)
     (100 "Continue")
     (101 "Switching Protocols")
     (200 "OK")
@@ -156,39 +194,47 @@ app
     (504 "Gateway Timeout")
     (505 "HTTP Version Not Supported")))
 
-(defmethod start-response-line ((stream response-stream))
-  (with-slots (fd protocol external-format) stream
-    (%format-to-fd fd external-format
-                   "~a ~d ~a~a"
-                   protocol
-                   (response-status-of stream)
-                   (response-message-of stream)
-                   +crlf+)))
+(defmethod start-response-line ((response response-stream))
+  (with-slots (fd protocol external-format) response
+    (format-to-response response external-format
+                        "~a ~d ~a~a"
+                        protocol
+                        (response-status-of response)
+                        (response-message-of response)
+                        +crlf+)))
 
-(defmethod start-response-header ((stream response-stream))
-  (with-slots (fd external-format) stream
-    (iterate (((k v) (scan-alist (response-headers-of stream))))
-      (%format-to-fd fd external-format
-                     "~a: ~a~a" k v +crlf+))
-    (%format-to-fd fd external-format "~a" +crlf+)))
+(defmethod start-response-header ((response response-stream))
+  (with-slots (fd external-format) response
+    (iterate (((k v) (scan-alist (response-headers-of response))))
+      (format-to-response response external-format
+                          "~a: ~a~a" k v +crlf+))
+    (format-to-response response external-format "~a" +crlf+)))
 
-(defmethod start-response ((stream response-stream))
-  (with-slots (fd) stream
+(defmethod start-response ((response response-stream))
+  (with-slots (fd) response
     (iolib.sockets::set-socket-option-int fd iolib.sockets::ipproto-tcp iolib.sockets::tcp-cork 1)
-    (start-response-line stream)
-    (start-response-header stream)
-    (setf (started-p stream) t)))
+    (start-response-line response)
+    (start-response-header response)
+    (setf (started-p response) t)))
 
-(defmethod start-response :before ((stream content-length-response-stream))
-  (with-slots (buffer) stream
-    (add-header stream "Content-Length" (loop for i in (queue-head buffer) sum (length i)))))
+(defmethod start-response :before ((response content-length-response-stream))
+  (with-slots (buffer) response
+    (add-header response "Content-Length" (loop for i in (queue-head buffer) sum (length i)))))
 
 
-(defun %format-to-fd (fd exteral-format format &rest args)
-  (cffi:with-foreign-string ((s length) (apply #'format nil format args)
-                             :encoding exteral-format
+(defgeneric format-to-response (response external-format format &rest args))
+
+(defmethod format-to-response ((response response-stream) external-format format &rest args)
+  (with-slots (fd) response
+    (cffi:with-foreign-string ((s length) (apply #'format nil format args)
+                             :encoding external-format
                              :null-terminated-p nil)
-    (isys:write fd s length)))
+      (sys-write fd s length))))
+
+(defmethod format-to-response ((response ssl-response-mixin) external-format format &rest args)
+  (with-slots (ssl-stream) response
+    (write-sequence (string-to-octets (apply #'format nil format args)) ssl-stream)))
+
 
 (defmethod add-header ((stream response-stream) key value)
   (push (cons key value) (response-headers-of stream)))
@@ -212,19 +258,18 @@ app
 
 
 (declaim (inline %write-chunk))
-(defun %write-chunk (fd buffer size)
+(defun %write-chunk (response buffer size)
   (unless (zerop size)
-    (%format-to-fd fd :latin-1 "~X~a" size +crlf+)
-    (isys:write fd buffer size)
-    (%format-to-fd fd :latin-1 +crlf+)))
+    (format-to-response response :latin-1 "~X~a" size +crlf+)
+    (write-to-response response buffer size)
+    (format-to-response response :latin-1 +crlf+)))
 
 (declaim (inline %write-last-chunk))
-(defun %write-last-chunk (fd)
-  (%format-to-fd fd :latin-1 "0~a~a" +crlf+ +crlf+))
+(defun %write-last-chunk (response)
+  (format-to-response response :latin-1 "0~a~a" +crlf+ +crlf+))
 
 (declaim (inline write-chunk))
-(defun write-chunk (stream buffer size)
-  (with-slots (fd) stream
-    (unless (started-p stream)
-      (start-response stream))
-    (%write-chunk fd buffer size)))
+(defun write-chunk (response buffer size)
+  (unless (started-p response)
+    (start-response response))
+  (%write-chunk response buffer size))

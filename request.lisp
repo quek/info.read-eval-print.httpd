@@ -4,30 +4,84 @@
 (defgeneric make-response-stream (request))
 
 (defclass request ()
-  ((env :initform (make-hash-table :test #'equal) :accessor env-of)
+  ((server :initarg :server)
+   (env :initform (make-hash-table :test #'equal) :accessor env-of)
    (fd :initarg :fd :accessor fd-of)
    (keep-alive-timer :initform nil)
    (parse-function :initform nil)
    (remain-request-buffer :initform nil)
    (post-data :initform nil)
    (params)
-   (pipe-write-fd :initarg :pipe-write-fd)))
+   (pipe-write-fd :initarg :pipe-write-fd)
+   (response :initform nil)))
 
 (defmethod reset-request ((request request))
-  (with-slots (env parse-function remain-request-buffer) request
+  (with-slots (env parse-function remain-request-buffer response) request
     (clrhash env)
     (setf parse-function nil)
     (setf remain-request-buffer nil)
-    (slot-makunbound request 'params)))
+    (slot-makunbound request 'params)
+    (setf response nil)))
+
+(defclass ssl-request-mixin ()
+  ((ssl-stream)))
+
+(defmethod initialize-instance :after ((self ssl-request-mixin) &key fd ssl-cert ssl-key)
+  (with-slots (ssl-stream) self
+    (setf ssl-stream (cl+ssl:make-ssl-server-stream fd
+                                                    :certificate ssl-cert
+                                                    :key ssl-key))))
+
+
+(defclass ssl-request (request ssl-request-mixin)
+  ())
 
 (defclass http-0.9-request (request)
+  ())
+
+(defclass https-0.9-request (ssl-request)
   ())
 
 (defclass http-1.0-request (request)
   ())
 
+(defclass https-1.0-request (ssl-request)
+  ())
+
 (defclass http-1.1-request (request)
   ())
+
+(defclass https-1.1-request (ssl-request)
+  ())
+
+(defgeneric receive-from (request buffer start end))
+
+(defmethod receive-from (request buffer start end)
+  (with-slots (fd) request
+    (handler-case (receive fd buffer start end)
+      (iolib.syscalls:econnreset () -1))))
+
+(defmethod receive-from ((request ssl-request) buffer start end)
+  (with-slots (ssl-stream) request
+    #+nil
+    (read-sequence buffer ssl-estream :start start :end end)
+    (let ((count 0)
+          (size (- end start)))
+      (loop for byte = (and (< count size)
+                            (listen ssl-stream)
+                            (read-byte ssl-stream))
+            while byte
+            do (setf (aref buffer start) byte)
+               (incf start)
+               (incf count))
+      (if (and (zerop count) (plusp size))
+          nil                           ;ewouldblock
+          count))))
+
+(defmethod response-of (request)
+  (with-slots (response) request
+    (or response
+        (setf response (make-response-stream request)))))
 
 (defmethod make-response-stream (request)
   (make-instance 'content-length-response-stream
@@ -40,6 +94,22 @@
                  :fd (slot-value request 'fd)
                  :protocol (env request :server-protocol)
                  :request request))
+
+(defmethod make-response-stream ((request ssl-request))
+  (with-slots (fd ssl-stream) request
+   (make-instance 'ssl-content-length-response-stream
+                  :fd fd
+                  :protocol (env request :server-protocol)
+                  :request request
+                  :ssl-stream ssl-stream)))
+
+(defmethod make-response-stream ((request https-1.1-request))
+  (with-slots (fd ssl-stream) request
+   (make-instance 'ssl-chunked-response-stream
+                  :fd fd
+                  :protocol (env request :server-protocol)
+                  :request request
+                  :ssl-stream ssl-stream)))
 
 (defmethod env ((request request) key &optional default-value)
   (with-slots (env) request

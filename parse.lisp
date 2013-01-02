@@ -40,13 +40,20 @@
        (values nil start #'parse-request-uri)))
 
 (defun request-class-from-protocol (protocol)
-  (cond ((equal protocol "HTTP/1.1")
-         'http-1.1-request)
-        ((equal protocol "HTTP/1.0")
-         'http-1.0-request)
-        ((equal protocol "HTTP/0.9")
-         'http-0.9-request)
-        (t (error 'invalid-request))))
+  (let ((ssl (ssl-p (thread-local-server *thread-local*))))
+    (cond ((equal protocol "HTTP/1.1")
+           (if ssl
+               'https-1.1-request
+               'http-1.1-request))
+          ((equal protocol "HTTP/1.0")
+           (if ssl
+               'https-1.0-request
+               'http-1.0-request))
+          ((equal protocol "HTTP/0.9")
+           (if ssl
+               'https-0.9-request
+               'http-0.9-request))
+          (t (error 'invalid-request)))))
 
 (defun parse-protocol (buffer start end request)
   (aif (position #x0d buffer :start start :end end)

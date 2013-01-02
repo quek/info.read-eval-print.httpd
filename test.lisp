@@ -17,11 +17,12 @@
                            :in hu.dwim.stefil:root-suite))
 
 
+(defparameter *dir* (pathname (directory-namestring #.(or *compile-file-truename* *load-truename*))))
+
 (defparameter *test-document-root*
   (string-right-trim '(#\/)
                      (directory-namestring
-                      (merge-pathnames "www/" #.(or *compile-file-truename*
-                                                    *load-truename*)))))
+                      (merge-pathnames "www/" *dir*))))
 
 (defparameter *test-host* "localhost")
 (defparameter *test-port* 19580)
@@ -114,7 +115,6 @@
       (hu.dwim.stefil:is (= 200 code))))
 
 
-
 (hu.dwim.stefil:deftest test-get-http/1.0 ()
   (hu.dwim.stefil:is (string= (with-output-to-string (*html-output*)
                                 (/hello))
@@ -122,7 +122,23 @@
                                                    :protocol :http/1.0))))
 
 
-
+(hu.dwim.stefil:deftest test-ssl-server ()
+  (let* ((port 4443)
+         (server (make-instance 'info.read-eval-print.httpd:ssl-server
+                                :document-root *test-document-root*
+                                :port port
+                                :ssl-cert (namestring (merge-pathnames "ssl/ssl.pem" *dir*))
+                                :ssl-key (namestring (merge-pathnames "ssl/ssl.key" *dir*)))))
+    (sb-thread:make-thread (lambda ()
+                             (info.read-eval-print.httpd:start server))
+                           :name "test ssl server")
+    (sleep 0.1)
+    (unwind-protect
+         (multiple-value-bind (content code)
+             (drakma:http-request (format nil "https://localhost:~a/index.html" port))
+           (hu.dwim.stefil:is (= 200 code))
+           (hu.dwim.stefil:is (string= (path-content "/index.html") content)))
+      (setf (info.read-eval-print.httpd:quit-p server) t))))
 
 
 (info.read-eval-print.httpd.test)

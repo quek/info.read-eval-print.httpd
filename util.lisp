@@ -3,6 +3,8 @@
 (deftype octet ()
   '(unsigned-byte 8))
 
+(deftype octet-vector () '(simple-array octet (*)))
+
 (defun make-octet-vector (size)
   (make-array size :element-type 'octet))
 
@@ -28,6 +30,7 @@
                             (cffi-sys:inc-pointer pointer start)
                             (- end start))))
 
+(declaim (inline send))
 (defun send (socket-fd buffer start end)
   (let ((length (- end start)))
     (cffi-sys:with-pointer-to-vector-data (pointer buffer)
@@ -38,6 +41,11 @@
                               (cffi-sys:null-pointer)
                               0))))
 
+(declaim (inline sys-write))
+(defun sys-write (fd buffer length)
+  (isys:write fd buffer length))
+
+(declaim (inline receive))
 (defun receive (socket-fd buffer start end)
   (let ((length (- end start)))
     (cffi-sys:with-pointer-to-vector-data (pointer buffer)
