@@ -2,7 +2,7 @@
 
 (defparameter *app-error-handler* 'default-app-error-handler)
 
-(defgeneric call (app request))
+(defgeneric call (app client))
 (defgeneric app-handler-thread-fds (app-handler))
 
 (defclass app-handler ()
@@ -11,18 +11,18 @@
    (threads :initform nil)
    (mailbox :initform (sb-concurrency:make-mailbox))))
 
-(defmethod handle-request or ((handler app-handler) server request)
+(defmethod handle-request or ((handler app-handler) server client)
   (with-slots (mailbox apps) handler
-    (awhen (assoc (env request :path-info) apps
+    (awhen (assoc (env client :path-info) apps
                   :test (lambda (a b)
                           (ppcre:scan (format nil "^~a([/?].*|$)" (ppcre:quote-meta-chars b))
                                       a)))
-      (with-slots (pipe-write-fd fd response close-function) request
-        (setf (env request :script-name) (car it)
-              (env request :path-info) (subseq (env request :path-info) (length (car it)))
-              (env request :application) (cdr it)
+      (with-slots (fd) client
+        (setf (env client :script-name) (car it)
+              (env client :path-info) (subseq (env client :path-info) (length (car it)))
+              (env client :application) (cdr it)
               (isys:fd-nonblock fd) nil)
-        (sb-concurrency:send-message mailbox request)
+        (sb-concurrency:send-message mailbox client)
         :detach))))
 
 (defmethod install-application ((handler app-handler) (application symbol) &key context-root)
@@ -38,29 +38,32 @@
     (isys:write pipe-write-fd buf #.(cffi:foreign-type-size :int))))
 
 (defun app-handler-loop (mailbox)
-  (loop for request = (sb-concurrency:receive-message mailbox)
-        do (with-slots (fd pipe-write-fd) request
-             (let ((*standard-output* (make-response-stream request)))
+  (loop for client = (sb-concurrency:receive-message mailbox)
+        do (with-slots (fd pipe-write-fd) client
+             (let ((*standard-output* client))
                (handler-case
                    (progn
-                     (call (env request :application) request)
+                     (call (env client :application) client)
                      (force-output *standard-output*)
-                     (reset-request request)
-                     (setf (isys:fd-nonblock fd) t)
-                     (return-client-fd fd pipe-write-fd))
+                     (if (keep-alive-p client)
+                         (progn
+                           (reset-client client)
+                           (setf (isys:fd-nonblock fd) t)
+                           (return-client-fd fd pipe-write-fd))
+                         (close client)))
                  (iolib.syscalls::epipe ()
                    (iolib.syscalls:close fd))
                  (error (e)
                    (iolib.syscalls:close fd)
-                   (funcall *app-error-handler* e request *standard-output*)))))))
+                   (funcall *app-error-handler* e client *standard-output*)))))))
 
-(defun default-app-error-handler (error request response)
-  (declare (ignore request response))
+(defun default-app-error-handler (error client response)
+  (declare (ignore client response))
   (format *error-output* "~a" error)
   (cerror "default-app-error-handler" error))
 
-(defun ignore-app-error-handler (error request response)
-  (declare (ignore request response))
+(defun ignore-app-error-handler (error client response)
+  (declare (ignore client response))
   (warn (format nil "~a" error)))
 
 (defmethod initialize-instance :after ((self app-handler) &key)
@@ -74,15 +77,15 @@
 (defclass env-dump-app ()
   ())
 
-(defmethod call ((aap env-dump-app) request)
+(defmethod call ((aap env-dump-app) client)
   (write-string "<html>
 <head><title>env-dump-app</title></head>
 <body>
   <ul>")
-   (iterate (((k v) (scan-hash (env-of request))))
+   (iterate (((k v) (scan-hash (env-of client))))
      (format t "<li>~a = ~a</li>" k v))
   (write-string "</ul>")
-  (print (h (princ-to-string request)))
+  (print (h (princ-to-string client)))
   (write-string "</body></html>"))
 
 

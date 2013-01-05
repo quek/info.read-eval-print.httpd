@@ -77,13 +77,13 @@ parse.lisp でも使っちゃった。")
 (defgeneric stop (server))
 (defgeneric install-application (server application &key context-root))
 
-(defgeneric handle-request (handler server request)
+(defgeneric handle-request (handler server client)
   (:method-combination or))
 
 (defgeneric accept (server))
 (defgeneric receive-request (fd))
 (defgeneric send-response (fd))
-(defgeneric close-connection (fd-or-request))
+(defgeneric close-connection (fd))
 
 (defclass server ()
   ((document-root :initarg :document-root :initform "/usr/share/doc")
@@ -107,12 +107,16 @@ parse.lisp でも使っちゃった。")
   (:method ((ssl-server ssl-server))
     t))
 
-(defgeneric make-request (server &rest args)
+(defmethod keep-alive-p ((server server))
+  (with-slots (keep-alive-timeout) server
+    keep-alive-timeout))
+
+(defgeneric make-client (server &rest args)
   (:method (server &rest args)
-    (apply #'make-instance 'request :server server args))
+    (apply #'make-instance 'http-client :server server args))
   (:method ((server ssl-server) &rest args)
     (with-slots (ssl-cert ssl-key) server
-      (apply #'make-instance 'ssl-request
+      (apply #'make-instance 'https-client
              :server server
              :ssl-cert ssl-cert
              :ssl-key ssl-key
@@ -142,10 +146,10 @@ parse.lisp でも使っちゃった。")
       (sb-thread:terminate-thread thread))))
 
 
-(defun set-keep-alive-timer (fd request)
+(defun set-keep-alive-timer (fd client)
   (let ((server (thread-local-server *thread-local*)))
-   (with-slots (keep-alive-timer) request
-     (when (and (keep-alive-p server request) (not keep-alive-timer))
+   (with-slots (keep-alive-timer) client
+     (when (and (keep-alive-p client) (not keep-alive-timer))
        (let ((timer (iomux::make-timer
                      (lambda ()
                        (print (list fd "close keep alive connection!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"))
@@ -160,11 +164,11 @@ parse.lisp でも使っちゃった。")
   (cffi:with-foreign-object (buf :int) (sb-posix:read pipe-read-fd buf #.(cffi:foreign-type-size :int))
     (let ((fd (cffi:mem-aref buf :int 0)))
       (sif (gethash fd (thread-local-fd-hash *thread-local*))
-           (if (keep-alive-p (thread-local-server *thread-local*) it)
+           (if (keep-alive-p it)
                (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-mod isys:epollin isys:epollhup epollet)
                (close-connection fd))
            (progn
-             (setf it (make-request server :fd fd :pipe-write-fd pipe-write-fd))
+             (setf it (make-client server :fd fd :pipe-write-fd pipe-write-fd))
              (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-add isys:epollin isys:epollhup epollet))))))
 
 (defun dispatch-epoll-event (fd event)
@@ -191,6 +195,7 @@ parse.lisp でも使っちゃった。")
                (if (= event-fd pipe-read-fd)
                    (add-to-epoll-wait server pipe-read-fd pipe-write-fd)
                    (dispatch-epoll-event event-fd event))
+             #+nil
              (error (e)
                (warn "~a" e)
                (ignore-errors
@@ -251,29 +256,29 @@ parse.lisp でも使っちゃった。")
   (with-slots (handler) server
     (install-application handler application :context-root context-root)))
 
-(defmethod normalize-request (server request buffer position fd)
+(defmethod normalize-request (server client buffer position fd)
   (with-slots (document-root) server
-    (setf (env request :document-root) document-root)
-    (let* ((request-uri (env request :request-uri))
+    (setf (env client :document-root) document-root)
+    (let* ((request-uri (env client :request-uri))
            (? (position #\? request-uri :start 1)))
-      (setf (env request :script-name) "")
-      (setf (env request :path-info) (subseq request-uri 0 ?))
-      (setf (env request :query-string) (if ? (subseq request-uri (1+ ?)) "")))
-    (setf (slot-value request 'fd) fd)
+      (setf (env client :script-name) "")
+      (setf (env client :path-info) (subseq request-uri 0 ?))
+      (setf (env client :query-string) (if ? (subseq request-uri (1+ ?)) "")))
+    (setf (slot-value client 'fd) fd)
     #+nil
     (iterate (((k v) (scan-hash (slot-value request 'env))))
       (format t "~a: ~a~%" k v))
-    request))
+    client))
 
-(defmethod parse-request (server fd buffer buffer-size request)
-  (with-slots (remain-request-buffer) request
+(defmethod parse-request (server fd buffer buffer-size client)
+  (with-slots (remain-request-buffer) client
     (prog ()
      :start
-       (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size request)
+       (multiple-value-bind (ok position) (start-parse-request buffer 0 buffer-size client)
          (if ok
              (progn
-               (normalize-request server request buffer position fd)
-               (set-keep-alive-timer fd request)
+               (normalize-request server client buffer position fd)
+               (set-keep-alive-timer fd client)
                (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-mod isys:epollout isys:epollhup epollet))
              ;; TODO buffer の上限。
              (let* ((remain-size (- buffer-size position))
@@ -285,10 +290,14 @@ parse.lisp でも使っちゃった。")
                          (di (scan-range)))
                  (setf (aref new-buffer di) (aref buffer si)))
                (setf (thread-local-buffer *thread-local*) new-buffer)
-               (let ((read-size (receive-from request new-buffer remain-size new-buffer-size)))
-                 (unless read-size
-                   (setf remain-request-buffer (subseq (thread-local-buffer *thread-local*) 0 remain-size))
-                   (return))
+               (let ((read-size
+                       (handler-case (read-sequence new-buffer client
+                                                    :start remain-size
+                                                    :end new-buffer-size)
+                         (io-block-error ()
+                           (setf remain-request-buffer
+                                 (subseq (thread-local-buffer *thread-local*) 0 remain-size))
+                           (return)))))
                  (setf buffer new-buffer)
                  (setf buffer-size (+ read-size remain-size))
                  (go :start))))))))
@@ -296,8 +305,8 @@ parse.lisp でも使っちゃった。")
 
 (defmethod receive-request (fd)
   (let ((server (thread-local-server *thread-local*))
-        (request (gethash fd (thread-local-fd-hash *thread-local*))))
-    (with-slots (remain-request-buffer) request
+        (client (gethash fd (thread-local-fd-hash *thread-local*))))
+    (with-slots (remain-request-buffer) client
       (let* ((start (let* ((buf remain-request-buffer)
                            (len (length buf)))
                       (iterate ((i (scan-range :length len)))
@@ -305,30 +314,30 @@ parse.lisp でも使っちゃった。")
                       (setf remain-request-buffer nil)
                       len))
              (buffer (thread-local-buffer *thread-local*))
-             (read-size (receive-from request buffer start (length buffer))))
+             (read-size (read-sequence buffer client :start start :end (length buffer))))
         (if (plusp read-size)
-            (parse-request server fd (thread-local-buffer *thread-local*) (+ start read-size) request)
+            (parse-request server fd (thread-local-buffer *thread-local*) (+ start read-size) client)
             (close-connection fd))))))
 
-(defun reset-client-fd-for-keep-alive (request fd)
-  (reset-request request)
+(defun reset-client-fd-for-keep-alive (client fd)
+  (reset-client client)
   (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-mod isys:epollin isys:epollhup epollet))
 
 (defmethod send-response (fd)
   (catch 'send-response
     (let ((server (thread-local-server *thread-local*)))
       (with-slots (document-root handler) server
-        (let ((request (gethash fd (thread-local-fd-hash *thread-local*))))
-          (case (handle-request handler server request)
+        (let ((client (gethash fd (thread-local-fd-hash *thread-local*))))
+          (case (handle-request handler server client)
             (:detach
              (detach-fd fd))
-            (t (if (keep-alive-p server request)
-                   (reset-client-fd-for-keep-alive request fd)
+            (t (if (keep-alive-p client)
+                   (reset-client-fd-for-keep-alive client fd)
                    (close-connection fd)))))))))
 
 (defun detach-fd (fd)
-  (let ((request (gethash fd (thread-local-fd-hash *thread-local*))))
-    (awhen (and request (slot-value request 'keep-alive-timer))
+  (let ((client (gethash fd (thread-local-fd-hash *thread-local*))))
+    (awhen (and client (slot-value client 'keep-alive-timer))
       (iomux::unschedule-timer (thread-local-timers *thread-local*) it))
     (remhash fd (thread-local-fd-hash *thread-local*))
     (epoll-ctl fd (thread-local-epoll-fd *thread-local*) isys:epoll-ctl-del)))
@@ -344,55 +353,52 @@ parse.lisp でも使っちゃった。")
        (iolib.sockets::set-socket-option-int ,fd iolib.sockets::ipproto-tcp
                                              iolib.sockets::tcp-cork 0))))
 
-(defgeneric sendfile (request fd path))
-(defmethod sendfile ((request request) fd path)
+(defgeneric sendfile (client fd path))
+(defmethod sendfile ((client http-client) fd path)
   (let* ((file-fd (handler-case (isys::open path isys:o-rdonly)
                     (isys:enoent ()
                       (warn "404 not found ~a" path)
                       (return-from sendfile nil))))
          (st (isys:fstat file-fd))
          (last-modified (rfc-2822-posix (isys:stat-mtime st)))
-         (content-length (isys:stat-size st))
-         (response (response-of request)))
+         (content-length (isys:stat-size st)))
+    (delete-header client "Transfer-Encoding")
     (with-cork (fd)
-      (write-to-response response
-                         (format nil "~
+      (format (raw-stream client) "~
 HTTP/1.1 200 OK~a~
 Content-Type: ~a~a~
 Content-Length: ~d~a~
 Date: ~a~a~
 Last-modified: ~a~a~
 ~a"
-                                 +crlf+
-                                 (path-mime-type path) +crlf+
-                                 content-length +crlf+
-                                 (rfc-2822-now) +crlf+
-                                 last-modified +crlf+
-                                 +crlf+)
-                         nil)
+              +crlf+
+              (path-mime-type path) +crlf+
+              content-length +crlf+
+              (rfc-2822-now) +crlf+
+              last-modified +crlf+
+              +crlf+)
       (let ((offset (cffi:foreign-alloc :long :initial-element 0)))
         (sendfile-loop fd file-fd offset content-length)))
     t))
 
-(defmethod sendfile ((request ssl-request) fd path)
-  (let ((response (response-of request)))
-    (let ((buffer (make-octet-vector #1=4096))
-          (src (handler-case (open path :element-type '(unsigned-byte 8))
-                 (error ()
-                   (warn "404 not found ~a" path)
-                   (return-from sendfile nil)))))
-      (ssl-sendfile-loop response src buffer #1#))))
+(defmethod sendfile ((client https-client) fd path)
+  (let ((buffer (make-octet-vector #1=4096))
+        (src (handler-case (open path :element-type '(unsigned-byte 8))
+               (error ()
+                 (warn "404 not found ~a" path)
+                 (return-from sendfile nil)))))
+    (ssl-sendfile-loop client src buffer #1#)))
 
 (defun sendfile-loop (dist-fd src-fd offset length)
   (loop for done = (handler-case (%sendfile dist-fd src-fd offset length)
                      (iolib.syscalls:ewouldblock ()
                        (setf (gethash dist-fd (thread-local-dispatch-out-table *thread-local*))
                              (lambda (dist-fd)
-                               (let ((request (gethash dist-fd (thread-local-fd-hash *thread-local*))))
+                               (let ((client (gethash dist-fd (thread-local-fd-hash *thread-local*))))
                                  (sendfile-loop dist-fd src-fd offset length)
                                  (remhash dist-fd (thread-local-dispatch-out-table *thread-local*))
-                                 (if (keep-alive-p (thread-local-server *thread-local*) request)
-                                     (reset-client-fd-for-keep-alive request dist-fd)
+                                 (if (keep-alive-p client)
+                                     (reset-client-fd-for-keep-alive client dist-fd)
                                      (close-connection dist-fd)))))
                        (throw 'send-response nil))
                      (error ()
@@ -402,24 +408,23 @@ Last-modified: ~a~a~
   (isys:close src-fd)
   t)
 
-(defun ssl-sendfile-loop (dst src buffer bufsiz)
+(defun ssl-sendfile-loop (client src buffer bufsiz)
   (loop  for len = (read-sequence buffer src :end bufsiz)
          until (not (plusp len))
-         do (handler-case (write-sequence buffer dst :end len)
-              (iolib.syscalls:ewouldblock ()
-                (with-slots (fd) dst
+         do (handler-case (write-sequence buffer client :end len)
+              (io-block-error ()
+                (with-slots (fd) client
                   (setf (gethash fd (thread-local-dispatch-out-table *thread-local*))
                         (lambda (fd)
-                          (let ((request (gethash fd (thread-local-fd-hash *thread-local*))))
-                            (ssl-sendfile-loop dst src buffer bufsiz)
-                            (remhash fd (thread-local-dispatch-out-table *thread-local*))
-                            (if (keep-alive-p (thread-local-server *thread-local*) request)
-                                (reset-client-fd-for-keep-alive request fd)
-                                (close-connection fd)))))
+                          (ssl-sendfile-loop client src buffer bufsiz)
+                          (remhash fd (thread-local-dispatch-out-table *thread-local*))
+                          (if (keep-alive-p client)
+                              (reset-client-fd-for-keep-alive client fd)
+                              (close-connection fd))))
                   (throw 'send-response nil)))
               (error ()
                 (loop-finish))))
-  (force-output dst)
+  (force-output client)
   (close src)
   t)
 
@@ -431,40 +436,41 @@ Last-modified: ~a~a~
 (defclass sendfile-handler ()
   ())
 
-(defmethod handle-request or ((handler sendfile-handler) server request)
-  (with-slots (fd) request
+(defmethod handle-request or ((handler sendfile-handler) server client)
+  (with-slots (fd) client
     (let* ((path (concatenate 'string
-                              (env request :document-root)
-                              (env request :path-info))))
+                              (env client :document-root)
+                              (env client :path-info))))
       (when (and (fad:file-exists-p path)
                  (not (fad:directory-exists-p path)))
-        (sendfile request fd path)))))
+        (sendfile client fd path)))))
 
 
 (defclass 404-handler ()
   ())
 
-(defmethod handle-request or ((handler 404-handler) server request)
-  (let ((response (make-response-stream request)))
-    (setf (response-status-of response) 404)
-    (format response  "<html>
+(defmethod handle-request or ((handler 404-handler) server client)
+  (setf (response-status-of client) 404)
+  (format client  "<html>
 <head><title>not found</title></head>
-<body>Not Found. ~a</body></html>" (h (env request :path-info)) )
-    (force-output response)
-    t))
+<body>Not Found. ~a</body></html>" (h (env client :path-info)) )
+  (force-output client)
+  t)
 
 
 (defclass default-handler (sendfile-handler app-handler 404-handler)
   ())
 
 #|
-(info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server))
+(info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server
+                                                 :application '(env-dump-app :context-root "/env")))
 (info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:server
                                                  :document-root "/tmp"))
 ab -n 10000 -c 10 'http://localhost:1958/sbcl-doc/html/index.html'
 
 (info.read-eval-print.httpd:start (make-instance 'info.read-eval-print.httpd:ssl-server
                                                  :ssl-cert "/home/ancient/letter/lisp/craft/info.read-eval-print.httpd/ssl/ssl.pem"
-                                                 :ssl-key "/home/ancient/letter/lisp/craft/info.read-eval-print.httpd/ssl/ssl.key"))
+                                                 :ssl-key "/home/ancient/letter/lisp/craft/info.read-eval-print.httpd/ssl/ssl.key"
+                                                 :application '(env-dump-app :context-root "/env")))
 
 |#

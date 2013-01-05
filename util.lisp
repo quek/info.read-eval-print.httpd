@@ -56,7 +56,7 @@
                                               (cffi:null-pointer)
                                               (cffi:null-pointer))
         (iolib.syscalls:ewouldblock ()
-          nil)))))
+          (error 'io-block-error))))))
 
 (defun h (s)
   (with-output-to-string (out)

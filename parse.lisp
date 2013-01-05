@@ -43,16 +43,16 @@
   (let ((ssl (ssl-p (thread-local-server *thread-local*))))
     (cond ((equal protocol "HTTP/1.1")
            (if ssl
-               'https-1.1-request
-               'http-1.1-request))
+               'https-1.1-client
+               'http-1.1-client))
           ((equal protocol "HTTP/1.0")
            (if ssl
-               'https-1.0-request
-               'http-1.0-request))
+               'https-1.0-client
+               'http-1.0-client))
           ((equal protocol "HTTP/0.9")
            (if ssl
-               'https-0.9-request
-               'http-0.9-request))
+               'https-0.9-client
+               'http-0.9-client))
           (t (error 'invalid-request)))))
 
 (defun parse-protocol (buffer start end request)

@@ -9,7 +9,8 @@
 (info.read-eval-print.series-ext:sdefpackage
  :info.read-eval-print.httpd.test
  (:use :cl :info.read-eval-print.httpd :info.read-eval-print.html)
- (:import-from :info.read-eval-print.httpd #:+crlf+))
+ (:import-from :info.read-eval-print.httpd #:+crlf+)
+ (:import-from :hu.dwim.stefil #:deftest #:is))
 
 (in-package :info.read-eval-print.httpd.test)
 
@@ -86,47 +87,51 @@
   (hu.dwim.stefil:with-fixture default-fixture
     (hu.dwim.stefil:-run-child-tests-)))
 
-(hu.dwim.stefil:deftest test-get ()
+(deftest test-get ()
   (iolib.sockets:with-open-socket (socket :remote-host *test-host*
                                           :remote-port *test-port*
                                           :external-format :utf-8)
     (send-line socket "GET /index.html HTTP/1.1")
     (send-line socket "Host: localhost")
     (send-line socket "")
-    (hu.dwim.stefil:is (string= "HTTP/1.1 200 OK" (receive-line socket))))
-  (hu.dwim.stefil:is (string= (path-content "/index.html")
-                              (drakma:http-request (url "/index.html")))))
+    (is (string= "HTTP/1.1 200 OK" (receive-line socket))))
+  (is (string= (path-content "/index.html")
+               (drakma:http-request (url "/index.html")))))
 
-(hu.dwim.stefil:deftest test-post ()
+(deftest test-post ()
   (multiple-value-bind (content code)
       (drakma:http-request (format nil "http://~a:~a/index.html" *test-host* *test-port*)
-                        :method :post
-                        :parameters ' (("ab" . "cd")
-                                       ("ef" . "gh")))
+                           :method :post
+                           :parameters ' (("ab" . "cd")
+                                          ("ef" . "gh")))
     (declare (ignore content))
-    (hu.dwim.stefil:is (= 200 code)))
-    (multiple-value-bind (content code)
+    (is (= 200 code)))
+  (multiple-value-bind (content code)
       (drakma:http-request (format nil "http://~a:~a/index.html" *test-host* *test-port*)
                            :method :post
                            :content-length 11
                            :parameters ' (("ab" . "cd")
                                           ("ef" . "gh")))
-      (declare (ignore content))
-      (hu.dwim.stefil:is (= 200 code))))
+    (declare (ignore content))
+    (is (= 200 code))))
 
+(deftest test-app-get ()
+  (is (string= (with-output-to-string (*html-output*)
+                 (/hello))
+               (drakma:http-request (url "/hello")))))
 
-(hu.dwim.stefil:deftest test-get-http/1.0 ()
-  (hu.dwim.stefil:is (string= (with-output-to-string (*html-output*)
-                                (/hello))
-                              (drakma:http-request (url "/hello")
-                                                   :protocol :http/1.0))))
+(deftest test-app-get-http/1.0 ()
+  (is (string= (with-output-to-string (*html-output*)
+                 (/hello))
+               (drakma:http-request (url "/hello")
+                                    :protocol :http/1.0))))
 
-
-(hu.dwim.stefil:deftest test-ssl-server ()
+(deftest test-ssl-server ()
   (let* ((port 4443)
          (server (make-instance 'info.read-eval-print.httpd:ssl-server
                                 :document-root *test-document-root*
                                 :port port
+                                :application 'test-app
                                 :ssl-cert (namestring (merge-pathnames "ssl/ssl.pem" *dir*))
                                 :ssl-key (namestring (merge-pathnames "ssl/ssl.key" *dir*)))))
     (sb-thread:make-thread (lambda ()
@@ -134,10 +139,18 @@
                            :name "test ssl server")
     (sleep 0.1)
     (unwind-protect
-         (multiple-value-bind (content code)
-             (drakma:http-request (format nil "https://localhost:~a/index.html" port))
-           (hu.dwim.stefil:is (= 200 code))
-           (hu.dwim.stefil:is (string= (path-content "/index.html") content)))
+         (progn
+           (is (string= (with-output-to-string (*html-output*)
+                          (/hello))
+                        (drakma:http-request (format nil "https://localhost:~a/hello" port))))
+           (is (string= (with-output-to-string (*html-output*)
+                          (/hello))
+                        (drakma:http-request (format nil "https://localhost:~a/hello" port)
+                                             :protocol :http/1.0)))
+           (multiple-value-bind (content code)
+               (drakma:http-request (format nil "https://localhost:~a/index.html" port))
+             (is (= 200 code))
+             (is (string= (path-content "/index.html") content))))
       (setf (info.read-eval-print.httpd:quit-p server) t))))
 
 
